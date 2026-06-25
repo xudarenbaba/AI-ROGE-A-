@@ -37,6 +37,8 @@
 
     <!-- onnxruntime-web：assault 姿态 RL 推理。如网络不通可替换为本地文件 -->
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
+    <!-- 寻路模块：assault APPROACH 阶段的栅格 A*，必须在 game.js 之前加载 -->
+    <script src="pathfinding.js"></script>
     <script src="game.js"></script>
   </body>
 </html>

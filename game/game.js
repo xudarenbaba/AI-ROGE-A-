@@ -20,7 +20,7 @@ const _RL_ACTION_VECTORS = [
   [-0.7071, -0.7071],    // 8 左上
 ];
 
-// 与 rl/env.py 常量对齐（v9：射线检测 + LSTM，OBS_DIM=112）
+// 与 rl/env.py 常量对齐（战斗专家版：射线检测 + LSTM，OBS_DIM=109）
 const _RL_CANVAS_W        = 900.0;
 const _RL_CANVAS_H        = 540.0;
 const _RL_DIAG            = Math.hypot(_RL_CANVAS_W, _RL_CANVAS_H);  // ~1051
@@ -41,18 +41,16 @@ for (let i = 0; i < _RL_N_RAYS; i++) {
   _RL_RAY_DIRS.push([Math.cos(a), Math.sin(a)]);
 }
 
-// 段长与 env.py 严格对齐
-const _RL_SEG1 = 4;
+// 段长与 env.py 严格对齐（战斗专家版：删绝对坐标/距离变化量/历史最小距离）
+const _RL_SEG1 = 3;                            // 自身：攻击冷却, hp, 敌人数量
 const _RL_SEG2 = 8;
 const _RL_SEG3 = (_RL_MAX_ENEMIES - 1) * 5;   // 20
 const _RL_SEG4 = _RL_MAX_BULLETS * 6;          // 48
 const _RL_SEG5 = _RL_N_RAYS;                   // 16（射线检测）
 const _RL_SEG6 = 4;
 const _RL_SEG7 = _RL_N_ACTIONS;               // 9
-const _RL_SEG8 = 1;
-const _RL_SEG9 = 1;                            // 最危险子弹 TTA
-const _RL_SEG10 = 1;                           // 历史最小距离
-const _RL_OBS_DIM = _RL_SEG1 + _RL_SEG2 + _RL_SEG3 + _RL_SEG4 + _RL_SEG5 + _RL_SEG6 + _RL_SEG7 + _RL_SEG8 + _RL_SEG9 + _RL_SEG10; // 112
+const _RL_SEG8 = 1;                            // 最危险子弹 TTA
+const _RL_OBS_DIM = _RL_SEG1 + _RL_SEG2 + _RL_SEG3 + _RL_SEG4 + _RL_SEG5 + _RL_SEG6 + _RL_SEG7 + _RL_SEG8; // 109
 
 // LSTM hidden state 维度（与训练模型对齐，导出后从 meta json 也可读取）
 const _RL_LSTM_HIDDEN = 128;
@@ -60,8 +58,6 @@ const _RL_LSTM_LAYERS = 1;
 
 // 帧间状态
 let _rlPrevAction = 0;
-let _rlPrevDistToTarget = 0.0;
-let _rlMinDistSoFar = Infinity;   // episode 内到目标的历史最近距离
 // LSTM hidden state（Float32Array，形状 [layers, 1, hidden]）
 let _rlHidden = null;   // h state
 let _rlCell   = null;   // c state
@@ -70,8 +66,8 @@ function _rlResetLstmState() {
   const size = _RL_LSTM_LAYERS * 1 * _RL_LSTM_HIDDEN;
   _rlHidden = new Float32Array(size);   // 全零
   _rlCell   = new Float32Array(size);
-  _rlMinDistSoFar = Infinity;
-  _rlPrevAction = 0;
+  _rlPrevAction  = 0;
+  _rlLastAction  = 0;   // 同步重置：避免上一 episode 的残留动作污染新交战首帧
 }
 
 // 状态：null = 未加载，"loading" = 加载中，InferenceSession = 就绪，"error" = 失败
@@ -145,18 +141,16 @@ function _rlRaycast(ox, oy, dx, dy) {
   return 1.0;
 }
 
-// 构建 121 维观测向量，与 rl/env.py _get_obs() 严格对齐（v2）
+// 构建 109 维观测向量，与 rl/env.py _get_obs() 严格对齐（战斗专家版）
 function _rlBuildObs(attackCd) {
   const obs  = new Float32Array(_RL_OBS_DIM);
   const ally = state.ally;
   let idx    = 0;
 
-  // ── 段1：自身状态 (4维) ─────────────────────────────────────────────────
-  // 去掉 hp 和障碍物距离：障碍物距离会让 agent 隐式学到"远离障碍物=安全"，
-  // 导致不敢进入地图中间区域；障碍物位置信息段5里已有完整描述
-  obs[idx++] = ally.x / _RL_CANVAS_W;
-  obs[idx++] = ally.y / _RL_CANVAS_H;
+  // ── 段1：自身状态 (3维) ─────────────────────────────────────────────────
+  // 战斗专家：去掉绝对坐标(战斗平移不变)，改放 hp（按血量调节冒险程度）
   obs[idx++] = Math.min(1.0, attackCd / _RL_ASSAULT_INTERVAL);
+  obs[idx++] = ally.hp / ally.maxHp;
   obs[idx++] = state.enemies.length / 11.0;
 
   // ── 段2：主目标敌人（最近，8维）──────────────────────────────────────────
@@ -167,7 +161,7 @@ function _rlBuildObs(attackCd) {
     const dist = Math.hypot(dx, dy);
     const shootCdMax = target.kind === "boss" ? 1.2 : 1.6;
     const los  = _rlHasLOS(ally.x, ally.y, target.x, target.y);
-    const inRange = (dist > 55 && dist < 110) ? 1.0 : 0.0;
+    const inRange = (dist > 65 && dist < 110) ? 1.0 : 0.0;  // 与 env ASSAULT_KITE_RANGE(65) 对齐
     obs[idx++] = dx / _RL_CANVAS_W;
     obs[idx++] = dy / _RL_CANVAS_H;
     obs[idx++] = dist / _RL_DIAG;
@@ -232,12 +226,7 @@ function _rlBuildObs(attackCd) {
   obs[idx + _rlPrevAction] = 1.0;
   idx += _RL_N_ACTIONS;
 
-  // ── 段8：到目标距离变化量 (1维) ─────────────────────────────────────────
-  const distNow   = target ? Math.hypot(target.x - ally.x, target.y - ally.y) : _rlPrevDistToTarget;
-  const distDelta = _rlPrevDistToTarget - distNow;  // >0 靠近
-  obs[idx++] = Math.max(-1.0, Math.min(1.0, distDelta / _RL_CANVAS_W * 10.0));
-
-  // ── 段9：最危险子弹 TTA (1维) ────────────────────────────────────────────
+  // ── 段8：最危险子弹 TTA (1维) ────────────────────────────────────────────
   // 所有威胁子弹中 TTA 最小值，0=即将命中，1=无威胁
   let minTTA = 1.0;
   for (const b of state.enemyBullets) {
@@ -248,21 +237,12 @@ function _rlBuildObs(attackCd) {
   }
   obs[idx++] = minTTA;
 
-  // ── 段10：历史最小距离 (1维) ─────────────────────────────────────────────
-  // 与 env.py 对齐：先更新历史最近距离，再写入 obs
-  if (target) {
-    if (distNow < _rlMinDistSoFar) _rlMinDistSoFar = distNow;
-    obs[idx++] = Math.min(1.0, _rlMinDistSoFar / _RL_DIAG);
-  } else {
-    obs[idx++] = 1.0;
-  }
-
   return obs;
 }
 
 function _rlNearestEnemy() {
   // LOS 加权评分，与 rl/env.py _nearest_enemy 严格对齐
-  // 评分 = 距离 × (LOS通畅 ? 1.0 : 1.8)，优先选有视线且近的敌人
+  // 评分 = 距离 × (LOS通畅 ? 1.0 : 1.3)，轻度偏好有视线且近的敌人
   if (state.enemies.length === 0) return null;
   const ally = state.ally;
   let best = null;
@@ -270,42 +250,22 @@ function _rlNearestEnemy() {
   for (const e of state.enemies) {
     const d     = Math.hypot(e.x - ally.x, e.y - ally.y);
     const los   = _rlHasLOS(ally.x, ally.y, e.x, e.y);
-    const score = d * (los ? 1.0 : 1.8);
+    const score = d * (los ? 1.0 : 1.3);
     if (score < bestScore) { bestScore = score; best = e; }
   }
   return best;
 }
 
-function _rlNearestObstacleDist() {
-  if (state.obstacles.length === 0) return _RL_DIAG;
-  let minD = Infinity;
-  const ally = state.ally;
-  for (const o of state.obstacles) {
-    const nx = Math.max(o.x, Math.min(ally.x, o.x + o.w));
-    const ny = Math.max(o.y, Math.min(ally.y, o.y + o.h));
-    const d  = Math.hypot(ally.x - nx, ally.y - ny);
-    if (d < minD) minD = d;
-  }
-  return minD;
-}
-
 // 同步推理：每帧调用，返回动作索引 0-8
 // onnxruntime-web 的 run() 是 async，但 MLP 推理耗时 < 1ms，
 // 使用缓存结果：每帧提交推理任务，下一帧使用上一帧的结果（滞后 1 帧，完全可接受）
-let _rlLastAction = 3;  // 默认向右（朝敌人方向）
+let _rlLastAction = 0;  // 初始化为静止；_rlResetLstmState 也会重置它
 let _rlInferring  = false;
 
 function _rlInferAsync(attackCd) {
   if (_rlLoadState !== "ready" || _rlInferring) return;
   if (!_rlHidden || !_rlCell) _rlResetLstmState();
   _rlInferring = true;
-
-  // 更新帧间距离（供下帧 obs 段8 使用）
-  const target = _rlNearestEnemy();
-  const ally   = state.ally;
-  _rlPrevDistToTarget = target
-    ? Math.hypot(target.x - ally.x, target.y - ally.y)
-    : _rlPrevDistToTarget;
 
   const obs = _rlBuildObs(attackCd);
   // LSTM 输入：obs[1,D]、h_in/c_in[layers,1,hidden]
@@ -329,6 +289,12 @@ function _rlInferAsync(attackCd) {
     _rlInferring = false;
   }).catch((e) => {
     console.error("[RL] inference error:", e);
+    // 推理失败（最常见：旧模型 obs 维度不匹配）→ 重置动作 + 切回寻路，
+    // 避免 _rlLastAction 冻结在错误值上导致 ally 持续撞墙
+    _rlLastAction = 0;
+    _rlPrevAction = 0;
+    state.ally.combatPhase = "approach";
+    state.ally.navPath = null;
     _rlInferring = false;
   });
 }
@@ -376,6 +342,12 @@ const state = {
     bubble: "",
     bubbleUntil: 0,
     dead: false,   // 死亡 flag，防止 checkDefeat 每帧重置气泡
+    // ── assault 分层控制 FSM ──────────────────────────────────────────────
+    combatPhase: "approach",  // "approach"(A*寻路) | "combat"(RL 战斗)
+    navPath: null,            // 当前 A* 平滑航点数组
+    navReplanCd: 0,           // 重规划倒计时(s)
+    navGoal: null,            // 上次规划时的目标坐标(判位移阈值)
+    losLostFrames: 0,         // COMBAT 中视线连续丢失帧数
   },
   enemies: [],
   playerBullets: [],
@@ -473,13 +445,15 @@ const OBSTACLE_LAYOUTS = [
     { x: 410, y: 245, w: 100, h: 20 },  // 中央横短条
   ],
   // 布局 2：分散长条（斜向交错）
+  // 注：中竖柱从 x=450 右移到 x=460，使其与左上横条(右端 x=430)间隙由 20px 扩至 30px，
+  // 满足 ally 膨胀半径 13px 后最小通道宽度 26px 的要求。
   [
-    { x: 270, y: 160, w: 160, h: 20 },  // 左上横条
+    { x: 270, y: 160, w: 160, h: 20 },  // 左上横条（右端 x=430）
     { x: 580, y: 200, w: 20,  h: 150 }, // 右侧竖条
     { x: 340, y: 340, w: 160, h: 20 },  // 左下横条
     { x: 630, y: 330, w: 140, h: 20 },  // 右下横条
     { x: 240, y: 280, w: 20,  h: 100 }, // 左竖柱
-    { x: 450, y: 150, w: 20,  h: 120 }, // 中竖柱
+    { x: 460, y: 150, w: 20,  h: 120 }, // 中竖柱（间隙 460-430=30px ≥ 26px）
   ],
   // 布局 3：十字形 + 外围长条
   [
@@ -492,9 +466,14 @@ const OBSTACLE_LAYOUTS = [
   ],
 ];
 
+// assault APPROACH 阶段的 A* 导航栅格（障碍物变更时重建）
+let _navGrid = null;
+
 function generateObstacles() {
   const idx = (state.floor - 1) % OBSTACLE_LAYOUTS.length;
   state.obstacles = OBSTACLE_LAYOUTS[idx];
+  // 障碍物按 ally 半径膨胀后栅格化；用真实可走画布尺寸(960×540)
+  _navGrid = buildNavGrid(state.obstacles, state.ally.radius, canvas.width, canvas.height);
 }
 
 // 圆形实体与矩形障碍物碰撞检测
@@ -539,8 +518,11 @@ function nextFloor() {
   state.player.hp = Math.min(state.player.maxHp, state.player.hp + 40);
   state.ally.hp   = Math.min(state.ally.maxHp,   state.ally.hp   + 40);
   state.ally.dead = false;   // 进入下一层时复活
-  // 关卡切换 = 新 episode，重置 LSTM hidden state
+  // 关卡切换 = 新 episode，重置 LSTM hidden state 与寻路 FSM（障碍物已变）
   if (_rlLoadState === "ready") _rlResetLstmState();
+  state.ally.combatPhase = "approach";
+  state.ally.navPath = null;
+  state.ally.losLostFrames = 0;
   generateObstacles();
   spawnEnemies();
   const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
@@ -681,17 +663,25 @@ function updatePlayer(dt) {
 
 function allyConfig() {
   if (state.ally.stance === "assault") {
-    return { attackRange: 110, kiteRange: 65, interval: 0.45, speedMul: 1.2, damage: 13, strafeAmp: 0.3 };
+    return { attackRange: 110, kiteRange: 65, interval: 0.45, speedMul: 1.2, damage: 13 };
   }
   // guard（默认）
-  return { attackRange: 0, kiteRange: 0, interval: 0.75, speedMul: 1.0, damage: 10, strafeAmp: 0 };
+  return { attackRange: 0, kiteRange: 0, interval: 0.75, speedMul: 1.0, damage: 10 };
 }
 
-function strafeVector(from, target) {
-  const dx = target.x - from.x;
-  const dy = target.y - from.y;
-  const len = Math.hypot(dx, dy) || 1;
-  return [-dy / len, dx / len];
+// APPROACH 阶段：按节流策略重规划到目标的 A* 路径
+function maybeReplanNav(target, dt) {
+  const a = state.ally;
+  a.navReplanCd -= dt;
+  const moved = a.navGoal ? Math.hypot(target.x - a.navGoal.x, target.y - a.navGoal.y) : Infinity;
+  // navPath 有效时：正常节流（计时器 + 目标位移）
+  // navPath 为 null（上次寻路失败）时：也走节流，避免每帧重复搜索无解情况
+  if (a.navReplanCd > 0 && moved < 36) return;
+  a.navReplanCd = 0.35;
+  a.navGoal = { x: target.x, y: target.y };
+  if (!_navGrid) _navGrid = buildNavGrid(state.obstacles, a.radius, canvas.width, canvas.height);
+  const raw = findPath(_navGrid, a, target);
+  a.navPath = raw ? smoothPath(raw, state.obstacles, a.radius) : null;
 }
 
 function updateAlly(dt) {
@@ -716,29 +706,44 @@ function updateAlly(dt) {
     // 触发懒加载（首次进入 assault 时）
     if (_rlLoadState === "idle") _rlLoadModel();
 
-    const [target] = findNearestEnemy(state.ally);
+    // 目标 = LOS 加权最近敌人（与 RL obs / 攻击 / env 统一）
+    const target = _rlNearestEnemy();
     if (target) {
-      if (_rlLoadState === "ready") {
-        // ── RL 控制移动 ────────────────────────────────────────────────────
+      const d   = distance(state.ally, target);
+      const los = _rlHasLOS(state.ally.x, state.ally.y, target.x, target.y);
+
+      if (state.ally.combatPhase === "approach") {
+        // ── A* 寻路接近（无模型依赖）───────────────────────────────────────
+        maybeReplanNav(target, dt);
+        const [mx, my] = state.ally.navPath
+          ? steerAlong(state.ally.navPath, state.ally, state.obstacles, state.ally.radius)
+          : [0, 0];
+        moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
+
+        // 交接 → COMBAT：进入射程 + 视线通畅 + 模型就绪
+        if (d <= cfg.attackRange && los && _rlLoadState === "ready") {
+          _rlResetLstmState();              // 新交战 = 新 episode，重置 LSTM
+          state.ally.combatPhase = "combat";
+          state.ally.losLostFrames = 0;
+          state.ally.navPath = null;
+        }
+
+      } else {
+        // ── RL 战斗微操（无规则兜底）──────────────────────────────────────
         // 提交本帧观测，下帧使用（滞后 1 帧，< 16ms，完全可接受）
         _rlInferAsync(state.ally.attackCd);
         const [mx, my] = _RL_ACTION_VECTORS[_rlLastAction];
         moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
-      } else {
-        // ── 降级：规则 AI（模型未就绪时）──────────────────────────────────
-        const d = distance(state.ally, target);
-        if (d > cfg.attackRange) {
-          const [nx, ny] = normalize(target.x - state.ally.x, target.y - state.ally.y);
-          moveWithCollision(state.ally, nx * speed * dt, ny * speed * dt);
-        } else if (d < cfg.kiteRange) {
-          const [nx, ny] = normalize(state.ally.x - target.x, state.ally.y - target.y);
-          moveWithCollision(state.ally, nx * speed * 0.6 * dt, ny * speed * 0.6 * dt);
-        } else {
-          const [sx, sy] = strafeVector(state.ally, target);
-          moveWithCollision(state.ally, sx * speed * cfg.strafeAmp * dt, sy * speed * cfg.strafeAmp * dt);
+
+        // 交回 → APPROACH：脱离射程(迟滞×1.3) 或 视线持续丢失
+        state.ally.losLostFrames = los ? 0 : state.ally.losLostFrames + 1;
+        if (d > cfg.attackRange * 1.3 || state.ally.losLostFrames >= 12) {
+          state.ally.combatPhase = "approach";
+          state.ally.navPath = null;
         }
       }
-      // 攻击逻辑不变：始终自动朝最近敌人开火
+
+      // 自动开火：两阶段共用，目标统一为 LOS 加权最近敌人
       if (state.ally.attackCd <= 0) {
         state.allyBullets.push(createBullet("ally", state.ally, target, 400, cfg.damage));
         state.ally.attackCd = cfg.interval;
@@ -1069,13 +1074,20 @@ function updateHud() {
   const stanceLabel = STANCE_LABELS[state.ally.stance] || state.ally.stance;
   const floorName = FLOOR_META[(state.floor - 1) % FLOOR_META.length].name;
 
-  // assault 姿态时显示 RL 模型加载状态
+  // assault 姿态时显示 FSM 阶段 + RL 模型加载状态
   let rlTag = "";
   if (state.ally.stance === "assault") {
-    if      (_rlLoadState === "ready")   rlTag = " [RL]";
-    else if (_rlLoadState === "loading") rlTag = " [RL 加载中…]";
-    else if (_rlLoadState === "error")   rlTag = " [RL 失败·规则]";
-    else                                 rlTag = " [规则]";
+    if (state.ally.combatPhase === "combat") {
+      rlTag = " [战斗·RL]";
+    } else if (_rlLoadState === "ready") {
+      rlTag = " [寻路]";
+    } else if (_rlLoadState === "loading") {
+      rlTag = " [寻路·RL加载中…]";
+    } else if (_rlLoadState === "error") {
+      rlTag = " [寻路·RL失败]";
+    } else {
+      rlTag = " [寻路]";
+    }
   }
 
   hudStats.textContent =
@@ -1135,8 +1147,13 @@ function applyStance(stance, reply) {
   if (!stance) return;
   // 客户端保底：NPC 无血时不允许切突击（正常情况由后端拦截并给出回复）
   if (stance === "assault" && state.ally.dead) return;
-  // 切到突击 = 新的决策 episode，重置 LSTM hidden state，避免上一段记忆污染
-  if (stance === "assault" && _rlLoadState === "ready") _rlResetLstmState();
+  // 切到突击 = 新的决策 episode：先寻路接近，重置 LSTM hidden state 与 FSM
+  if (stance === "assault") {
+    state.ally.combatPhase = "approach";
+    state.ally.navPath = null;
+    state.ally.losLostFrames = 0;
+    if (_rlLoadState === "ready") _rlResetLstmState();
+  }
   state.ally.stance = stance;
   const label  = STANCE_LABELS[stance] || stance;
   const bubble = reply || `姿态切换：${label}。`;

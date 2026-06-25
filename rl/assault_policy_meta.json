@@ -1,5 +1,5 @@
 {
-  "obs_dim": 112,
+  "obs_dim": 109,
   "n_actions": 9,
   "action_vectors": [
     [

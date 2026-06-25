@@ -96,75 +96,6 @@ class ProgressCallback(BaseCallback):
         return True
 
 
-class CurriculumCallback(BaseCallback):
-    """
-    课程学习回调：每隔 update_freq 步更新所有并行环境的 curriculum_ratio。
-
-    ratio = 当前步数 / 总步数，从 0.0 线性增长到 1.0。
-    env 内部根据 ratio 决定 5 阶段难度（见 AssaultEnv._curriculum_stage）：
-      0.00~0.20 阶段0 无障碍 + 敌人近
-      0.20~0.40 阶段1 单块障碍 + 敌人中距
-      0.40~0.60 阶段2 简单布局 + 全图敌人
-      0.60~0.80 阶段3 中等布局
-      0.80~1.00 阶段4 全部布局
-
-    用 VecEnv.env_method 跨进程调用，兼容 SubprocVecEnv（关键：
-    SubprocVecEnv 没有 .envs 属性，直接访问会静默失效）。
-    """
-
-    _STAGE_NAMES = [
-        "阶段0:无障碍·敌人近",
-        "阶段1:单块障碍·中距",
-        "阶段2:简单布局·全图",
-        "阶段3:中等布局",
-        "阶段4:全部布局",
-    ]
-
-    def __init__(self, total_timesteps: int, update_freq: int = 1024) -> None:
-        super().__init__()
-        self.total_timesteps = total_timesteps
-        self.update_freq     = update_freq
-        self._last_update    = 0
-        self._last_stage     = -1
-
-    @staticmethod
-    def _stage_of(ratio: float) -> int:
-        if ratio < 0.20:
-            return 0
-        if ratio < 0.40:
-            return 1
-        if ratio < 0.60:
-            return 2
-        if ratio < 0.80:
-            return 3
-        return 4
-
-    def _on_step(self) -> bool:
-        if self.num_timesteps - self._last_update < self.update_freq:
-            return True
-        self._last_update = self.num_timesteps
-
-        ratio = min(1.0, self.num_timesteps / max(1, self.total_timesteps))
-
-        stage = self._stage_of(ratio)
-        if stage != self._last_stage:
-            print(f"\n[Curriculum] {self._STAGE_NAMES[stage]}  ratio={ratio:.2f}\n")
-            self._last_stage = stage
-
-        # 用 env_method 跨进程调用，兼容 Subproc/Dummy VecEnv
-        try:
-            self.training_env.env_method("set_curriculum_ratio", ratio)
-        except Exception:  # noqa: BLE001
-            # 兜底：DummyVecEnv 直接访问
-            for env in getattr(self.training_env, "envs", []):
-                inner = env
-                while hasattr(inner, "env"):
-                    inner = inner.env
-                if hasattr(inner, "set_curriculum_ratio"):
-                    inner.set_curriculum_ratio(ratio)
-        return True
-
-
 # ── 主函数 ────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -216,7 +147,6 @@ def main() -> None:
     # ── 回调 ─────────────────────────────────────────────────────────────────
     callbacks = [
         ProgressCallback(print_freq=100_000),
-        CurriculumCallback(total_timesteps=args.timesteps, update_freq=1024),
         CheckpointCallback(
             save_freq=max(args.checkpoint_freq // args.n_envs, 1),
             save_path=str(ckpt_dir),
