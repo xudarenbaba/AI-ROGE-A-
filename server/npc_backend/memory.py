@@ -186,7 +186,11 @@ class MemoryStore:
         )
 
     def search_context(
-        self, query: str, player_id: str, npc_id: str
+        self,
+        query: str,
+        player_id: str,
+        npc_id: str,
+        executor: ThreadPoolExecutor | None = None,
     ) -> dict[str, list[str]]:
         """query 只 embed 一次，并行查询四路记忆，返回结构化上下文。"""
         embedding = _embed_texts([query])[0]
@@ -220,18 +224,33 @@ class MemoryStore:
             ),
         }
 
+        return self._parallel_query_tasks(tasks, embedding, executor)
+
+    def _parallel_query_tasks(
+        self,
+        tasks: dict[str, tuple[dict[str, Any], int]],
+        embedding: list[float],
+        executor: ThreadPoolExecutor | None,
+    ) -> dict[str, list[str]]:
         results: dict[str, list[str]] = {}
-        with ThreadPoolExecutor(max_workers=4) as executor:
+
+        def _collect(pool: ThreadPoolExecutor) -> dict[str, list[str]]:
             futures = {
-                executor.submit(self._query_with_embedding, embedding, where, limit): key
+                pool.submit(self._query_with_embedding, embedding, where, limit): key
                 for key, (where, limit) in tasks.items()
             }
+            out: dict[str, list[str]] = {}
             for future in as_completed(futures):
                 key = futures[future]
                 try:
-                    results[key] = future.result()
+                    out[key] = future.result()
                 except Exception:
-                    results[key] = []
+                    out[key] = []
+            return out
 
-        return results
+        if executor is not None:
+            return _collect(executor)
+
+        with ThreadPoolExecutor(max_workers=4) as local_pool:
+            return _collect(local_pool)
 

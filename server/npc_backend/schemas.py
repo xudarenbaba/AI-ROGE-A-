@@ -13,6 +13,16 @@ class ChatRequest(BaseModel):
     npc_name: str | None = None
 
 
+class ThinkRequest(BaseModel):
+    player_id: str = Field(min_length=1)
+    npc_id: str = Field(min_length=1)
+    scene_info: dict[str, Any] = Field(default_factory=dict)
+    npc_name: str | None = None
+    trigger: str = "periodic"
+    priority: int = 3
+    trigger_reason: str = ""
+
+
 class ChatAction(BaseModel):
     action_type: str = "dialogue"
     dialogue: str

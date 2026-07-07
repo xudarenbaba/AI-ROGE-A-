@@ -23,3 +23,45 @@ memory:
   k_dialogue_daily: 4
   k_dialogue_important: 6
   min_store_chars: 6
+
+npc_autonomy:
+  enabled: true
+  reflex_enabled: true
+  idle_threshold_s: 8
+  think_interval_s: 12
+  speech_cooldown_s: 15
+  critical_speech_cd_mul: 0.5
+  stance_change_cooldown_s: 25
+  intent_ttl_s: 30
+  noop_backoff_s: [15, 30, 60]
+  rule_noop_after: 2
+  require_scene_change: true
+  stale_force_think_s: 75
+  recent_lines_max: 8
+  duplicate_similarity: 0.55
+  max_speech_per_minute: 4
+  triggers:
+    ally_critical_hp_pct: 0.25
+    ally_dire_hp_pct: 0.10
+    player_danger_hp_pct: 0.30
+    player_idle_for_help_s: 8
+    social_beat_s: 45
+    periodic_fallback_s: 75
+    assault_guard_min_s: 10
+    assault_player_active_s: 6
+    assault_min_ally_hp_pct: 0.35
+    assault_min_player_hp_pct: 0.35
+    assault_max_enemies: 8
+    assault_max_nearest_dist: 420
+  assault_stance_cooldown_s: 10
+
+concurrency:
+  worker_threads: 8
+
+logging:
+  file: data/logs/npc.log
+  level: INFO
+  console: true
+  clear_on_start: true
+  max_bytes: 2000000
+  backup_count: 3

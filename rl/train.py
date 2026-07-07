@@ -46,8 +46,8 @@ from rl.env import AssaultEnv
 
 # RecurrentPPO（LSTM）超参数。LSTM 适合较小的 batch、较短的 n_steps。
 DEFAULTS = {
-    "timesteps":    20_000_000,
-    "n_envs":       8,           # 并行环境数
+    "timesteps":    80_000_000,
+    "n_envs":       28,           # 并行环境数
     "n_steps":      512,         # 每个 env 每次 rollout 的步数（LSTM 用短一点）
     "batch_size":   256,         # minibatch 大小（需能整除 n_envs*n_steps）
     "n_epochs":     10,
@@ -60,7 +60,7 @@ DEFAULTS = {
     "max_grad_norm":0.5,
     "net_arch":     [256, 256],  # LSTM 之后的 MLP 头
     "lstm_hidden":  128,         # LSTM 隐藏单元数
-    "run_name":     "assault_lstm_v1",
+    "run_name":     "assault_combat_v3",
     "checkpoint_freq": 500_000,
     "eval_freq":    100_000,
     "eval_episodes":20,

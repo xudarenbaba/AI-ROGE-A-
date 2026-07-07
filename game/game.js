@@ -1,4 +1,5 @@
 const NPC_API = "http://127.0.0.1:5100";
+const NPC_AUTONOMY_BUILD = "autonomy9";
 
 // ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
 // onnxruntime-web 从 CDN 加载；如需离线部署可改为本地路径。
@@ -28,7 +29,19 @@ const _RL_MAX_ENEMIES     = 5;
 const _RL_MAX_BULLETS     = 8;
 const _RL_MAX_BULLET_DIST = 200.0;
 const _RL_ASSAULT_INTERVAL = 0.45;
+const _RL_BULLET_TTL       = 2.2;
 const _RL_N_ACTIONS       = 9;
+
+// assault FSM / 动作后处理（与优化方案对齐）
+const _COMBAT_ENTER_LOS_FRAMES = 10;
+const _COMBAT_EXIT_DIST_MUL    = 1.3;
+const _COMBAT_HOLD_MAX_SEC     = 2.5;    // 1c：已废除 hold 阶段，常量保留避免牵连
+const _COMBAT_LOS_LOST_EXIT_FRAMES = 24; // 1c：combat 中连续丢 LOS ≥24帧(0.4s)才退回 approach
+const _ENGAGE_POINT_REACH      = 20;
+const _SAFE_HOLD_TTA_SEC       = 0.40;  // 方案A：不再用于强制静止（保留常量备用）
+const _EMERGENCY_DODGE_TTA_SEC = 0.25;
+const _MIN_ACTION_HOLD_FRAMES  = 3;     // 方案A：5 → 3（约 50ms，防抖更轻）
+const _ACTION_SWITCH_MARGIN    = 0.10;  // 方案A：0.30 → 0.10（降低移动间切换门槛）
 
 // 射线检测（与 env.py N_RAYS / RAY_MAX_DIST / RAY_STEPS 严格对齐）
 const _RL_N_RAYS       = 16;
@@ -58,6 +71,13 @@ const _RL_LSTM_LAYERS = 1;
 
 // 帧间状态
 let _rlPrevAction = 0;
+let _rlRawAction = 0;
+let _rlAppliedAction = 0;
+let _rlActionHoldRemain = 0;
+let _rlLastLogits = null;
+// 方案A 诊断：统计 RL 原始动作(argmax)分布；若几乎全集中在 index 0(静止)，说明模型已退化为站桩，需走方案B 重训
+let _rlRawHist = new Array(_RL_N_ACTIONS).fill(0);
+let _rlRawHistCount = 0;
 // LSTM hidden state（Float32Array，形状 [layers, 1, hidden]）
 let _rlHidden = null;   // h state
 let _rlCell   = null;   // c state
@@ -66,8 +86,11 @@ function _rlResetLstmState() {
   const size = _RL_LSTM_LAYERS * 1 * _RL_LSTM_HIDDEN;
   _rlHidden = new Float32Array(size);   // 全零
   _rlCell   = new Float32Array(size);
-  _rlPrevAction  = 0;
-  _rlLastAction  = 0;   // 同步重置：避免上一 episode 的残留动作污染新交战首帧
+  _rlPrevAction = 0;
+  _rlRawAction = 0;
+  _rlAppliedAction = 0;
+  _rlActionHoldRemain = 0;
+  _rlLastLogits = null;
 }
 
 // 状态：null = 未加载，"loading" = 加载中，InferenceSession = 就绪，"error" = 失败
@@ -109,16 +132,117 @@ function _rlHasLOS(ax, ay, bx, by) {
   return true;
 }
 
-// 子弹预测碰撞时间（与 env.py _bullet_time_to_ally 对齐）
+// 圆盘碰撞 TTA（秒）；未命中或背向返回 BULLET_TTL（与 env.py _bullet_time_to_ally 对齐）
+function _rlBulletTTASec(b, ally) {
+  const rx = ally.x - b.x;
+  const ry = ally.y - b.y;
+  const vx = b.vx;
+  const vy = b.vy;
+  const v2 = vx * vx + vy * vy;
+  if (v2 < 1e-6) return _RL_BULLET_TTL;
+  const hitR = ally.radius + (b.radius || 4);
+  const a = v2;
+  const bCoef = 2 * (rx * vx + ry * vy);
+  const c = rx * rx + ry * ry - hitR * hitR;
+  const disc = bCoef * bCoef - 4 * a * c;
+  if (disc < 0) return _RL_BULLET_TTL;
+  const sqrtDisc = Math.sqrt(disc);
+  let tHit = null;
+  for (const t of [(-bCoef - sqrtDisc) / (2 * a), (-bCoef + sqrtDisc) / (2 * a)]) {
+    if (t >= 0 && (tHit === null || t < tHit)) tHit = t;
+  }
+  if (tHit === null || tHit > _RL_BULLET_TTL) return _RL_BULLET_TTL;
+  return tHit;
+}
+
+function _rlBulletWillHit(b, ally) {
+  return _rlBulletTTASec(b, ally) < _RL_BULLET_TTL - 1e-4;
+}
+
+// 归一化 TTA（obs / 排序用）
 function _rlBulletTTA(b, ally) {
-  const dx  = ally.x - b.x;
-  const dy  = ally.y - b.y;
-  const spd = Math.hypot(b.vx, b.vy);
-  if (spd < 1e-6) return 1.0;
-  const proj = (dx * b.vx + dy * b.vy) / spd;
-  if (proj <= 0) return 1.0;
-  const tta = proj / spd;
-  return Math.min(1.0, Math.max(0.0, tta / 2.2));  // 2.2 = BULLET_TTL
+  return Math.min(1.0, Math.max(0.0, _rlBulletTTASec(b, ally) / _RL_BULLET_TTL));
+}
+
+function _rlMinBulletTTASec() {
+  const ally = state.ally;
+  let minSec = _RL_BULLET_TTL;
+  for (const b of state.enemyBullets) {
+    if (Math.hypot(b.x - ally.x, b.y - ally.y) > _RL_MAX_BULLET_DIST) continue;
+    if (!_rlBulletWillHit(b, ally)) continue;
+    minSec = Math.min(minSec, _rlBulletTTASec(b, ally));
+  }
+  return minSec;
+}
+
+function _rlEmergencyDodgeAction() {
+  const ally = state.ally;
+  let worst = null;
+  let worstTta = Infinity;
+  for (const b of state.enemyBullets) {
+    if (Math.hypot(b.x - ally.x, b.y - ally.y) > _RL_MAX_BULLET_DIST) continue;
+    const ttaSec = _rlBulletTTASec(b, ally);
+    if (ttaSec >= _EMERGENCY_DODGE_TTA_SEC || !_rlBulletWillHit(b, ally)) continue;
+    if (ttaSec < worstTta) { worstTta = ttaSec; worst = b; }
+  }
+  if (!worst) return null;
+  const spd = Math.hypot(worst.vx, worst.vy) || 1;
+  const ux = worst.vx / spd;
+  const uy = worst.vy / spd;
+  const dx = ally.x - worst.x;
+  const dy = ally.y - worst.y;
+  const lateral = -uy * dx + ux * dy;
+  const sign = lateral >= 0 ? 1 : -1;
+  const ex = -uy * sign;
+  const ey = ux * sign;
+  let bestA = 1;
+  let bestDot = -Infinity;
+  for (let i = 1; i < _RL_ACTION_VECTORS.length; i += 1) {
+    const [vx, vy] = _RL_ACTION_VECTORS[i];
+    const dot = vx * ex + vy * ey;
+    if (dot > bestDot) { bestDot = dot; bestA = i; }
+  }
+  return bestA;
+}
+
+function _rlResolveAction(los, minTtaSec) {
+  // 方案A：移除 Safe-Hold 强制静止，把“安全时动不动”的决定权交还 RL 模型；
+  // 仅保留“紧急闪避”硬逻辑 + 温和防抖（只抑制移动方向间的高频互切）。
+  // 参数 los 暂保留以兼容调用处签名（当前逻辑不再使用）。
+  void los;
+
+  // 1) 紧急闪避：子弹即将命中 → 强制横向规避（最高优先级）
+  const dodge = minTtaSec < _EMERGENCY_DODGE_TTA_SEC ? _rlEmergencyDodgeAction() : null;
+  if (dodge !== null) {
+    _rlAppliedAction = dodge;
+    _rlActionHoldRemain = _MIN_ACTION_HOLD_FRAMES;
+    _rlPrevAction = dodge;
+    return dodge;
+  }
+
+  // 2) 期望动作 = RL 原始输出（不再被 Safe-Hold 摁成静止）
+  let desired = _rlRawAction;
+
+  // 3) 防抖：只抑制“移动→移动”的高频互切，绝不阻止“静止→移动”的启动
+  if (_rlLastLogits
+      && desired !== _rlAppliedAction
+      && desired !== 0 && _rlAppliedAction !== 0
+      && _rlLastLogits[desired] - _rlLastLogits[_rlAppliedAction] < _ACTION_SWITCH_MARGIN) {
+    desired = _rlAppliedAction;
+  }
+
+  // 4) 最短保持帧：切换后保持若干帧，平滑残余抖动
+  if (desired !== _rlAppliedAction && _rlActionHoldRemain > 0) {
+    _rlActionHoldRemain -= 1;
+    _rlPrevAction = _rlAppliedAction;
+    return _rlAppliedAction;
+  }
+  _rlActionHoldRemain = desired !== _rlAppliedAction
+    ? _MIN_ACTION_HOLD_FRAMES
+    : Math.max(0, _rlActionHoldRemain - 1);
+  _rlAppliedAction = desired;
+  _rlPrevAction = desired;
+  return desired;
 }
 
 // 射线检测：从 (ox,oy) 沿 (dx,dy) 步进，返回到障碍物/边界的归一化距离
@@ -256,11 +380,8 @@ function _rlNearestEnemy() {
   return best;
 }
 
-// 同步推理：每帧调用，返回动作索引 0-8
-// onnxruntime-web 的 run() 是 async，但 MLP 推理耗时 < 1ms，
-// 使用缓存结果：每帧提交推理任务，下一帧使用上一帧的结果（滞后 1 帧，完全可接受）
-let _rlLastAction = 0;  // 初始化为静止；_rlResetLstmState 也会重置它
-let _rlInferring  = false;
+// 异步推理：提交本帧 obs，下帧用 _rlRawAction + 后处理层输出实际移动
+let _rlInferring = false;
 
 function _rlInferAsync(attackCd) {
   if (_rlLoadState !== "ready" || _rlInferring) return;
@@ -268,7 +389,6 @@ function _rlInferAsync(attackCd) {
   _rlInferring = true;
 
   const obs = _rlBuildObs(attackCd);
-  // LSTM 输入：obs[1,D]、h_in/c_in[layers,1,hidden]
   const hShape = [_RL_LSTM_LAYERS, 1, _RL_LSTM_HIDDEN];
   const feeds = {
     obs:  new ort.Tensor("float32", obs, [1, _RL_OBS_DIM]),
@@ -276,22 +396,27 @@ function _rlInferAsync(attackCd) {
     c_in: new ort.Tensor("float32", _rlCell,   hShape),
   };
   _rlSession.run(feeds).then(output => {
-    const logits = output.logits.data;  // Float32Array[9]
+    const logits = output.logits.data;
+    _rlLastLogits = logits;
     let best = 0;
     for (let i = 1; i < logits.length; i++) {
       if (logits[i] > logits[best]) best = i;
     }
-    _rlLastAction = best;
-    _rlPrevAction = best;
-    // 递推 LSTM hidden state：本帧输出作为下帧输入（关键）
+    _rlRawAction = best;
+    // 方案A 诊断：每 120 次推理打印一次原始动作分布（idx0=静止, 1..8=八方向）
+    _rlRawHist[best] += 1;
+    if (++_rlRawHistCount >= 120) {
+      console.log("[RL] rawAction 分布/120帧 [静,上,右上,右,右下,下,左下,左,左上]:", _rlRawHist.join(","));
+      _rlRawHist = new Array(_RL_N_ACTIONS).fill(0);
+      _rlRawHistCount = 0;
+    }
     _rlHidden = output.h_out.data;
     _rlCell   = output.c_out.data;
     _rlInferring = false;
   }).catch((e) => {
     console.error("[RL] inference error:", e);
-    // 推理失败（最常见：旧模型 obs 维度不匹配）→ 重置动作 + 切回寻路，
-    // 避免 _rlLastAction 冻结在错误值上导致 ally 持续撞墙
-    _rlLastAction = 0;
+    _rlRawAction = 0;
+    _rlAppliedAction = 0;
     _rlPrevAction = 0;
     state.ally.combatPhase = "approach";
     state.ally.navPath = null;
@@ -343,11 +468,13 @@ const state = {
     bubbleUntil: 0,
     dead: false,   // 死亡 flag，防止 checkDefeat 每帧重置气泡
     // ── assault 分层控制 FSM ──────────────────────────────────────────────
-    combatPhase: "approach",  // "approach"(A*寻路) | "combat"(RL 战斗)
-    navPath: null,            // 当前 A* 平滑航点数组
-    navReplanCd: 0,           // 重规划倒计时(s)
-    navGoal: null,            // 上次规划时的目标坐标(判位移阈值)
-    losLostFrames: 0,         // COMBAT 中视线连续丢失帧数
+    combatPhase: "approach",  // 1c：两态 "approach"(A* 接近) | "combat"(RL 战斗)
+    navPath: null,
+    navReplanCd: 0,
+    navGoal: null,
+    engagePoint: null,
+    losStableFrames: 0,
+    losLostFrames: 0,         // 1c：combat 中连续丢 LOS 帧数，≥阈值退回 approach
   },
   enemies: [],
   playerBullets: [],
@@ -392,7 +519,7 @@ function safeSpawnPos(baseX, baseY, radius, fallbackX, fallbackY) {
   return { x: fallbackX, y: fallbackY };
 }
 
-function spawnEnemies() {
+function spawnEnemies(emitNpcEvents = true) {
   const { hpMul, speedMul, mobCount } = floorScale();
   const mobs = [];
   for (let i = 0; i < mobCount; i += 1) {
@@ -420,6 +547,7 @@ function spawnEnemies() {
   });
   state.enemies = mobs;
   state.bossAlive = true;
+  if (emitNpcEvents) npcPushEvent("boss_spawn", { floor: state.floor });
 }
 
 // ── 障碍物 ────────────────────────────────────────────────────────────────────
@@ -522,6 +650,8 @@ function nextFloor() {
   if (_rlLoadState === "ready") _rlResetLstmState();
   state.ally.combatPhase = "approach";
   state.ally.navPath = null;
+  state.ally.engagePoint = null;
+  state.ally.losStableFrames = 0;
   state.ally.losLostFrames = 0;
   generateObstacles();
   spawnEnemies();
@@ -534,6 +664,7 @@ function updateFloorTransition(dt) {
   state.transitionTimer -= dt;
   if (state.transitionTimer <= 0) {
     state.floor += 1;
+    npcPushEvent("floor_enter", { floor: state.floor });
     nextFloor();
     state.floorState = "playing";
   }
@@ -542,7 +673,7 @@ function updateFloorTransition(dt) {
 // ── 初始化第一关 ──────────────────────────────────────────────────────────────
 
 generateObstacles();
-spawnEnemies();
+spawnEnemies(false); // 脚本前部初始化，NPC 模块尚未就绪
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -624,11 +755,14 @@ function findNearestEnemy(from) {
 // ── 游戏逻辑更新 ──────────────────────────────────────────────────────────────
 
 function removeDeadEnemies() {
+  const kills = state.enemies.filter((e) => e.hp <= 0).length;
+  if (kills > 0) npcPushEvent("kill", { count: kills });
   state.enemies = state.enemies.filter((e) => e.hp > 0);
   state.bossAlive = state.enemies.some((e) => e.kind === "boss");
   if (state.enemies.length === 0 && state.floorState === "playing" && !state.result) {
     state.floorState = "clear";
     state.transitionTimer = 3.0;
+    npcPushEvent("floor_clear", { floor: state.floor });
     setAllyBubble(`第 ${state.floor} 层清除！稍作准备，下一层马上来。`);
   }
 }
@@ -644,6 +778,7 @@ function playerAttack() {
   if (!target) return;
   state.player.attackCd = 0.3;
   state.playerBullets.push(createBullet("player", state.player, target, 430, 18));
+  npcMarkPlayerAction();
 }
 
 function updatePlayer(dt) {
@@ -656,6 +791,7 @@ function updatePlayer(dt) {
   if (state.keys.ArrowRight || state.keys.KeyD) dx += 1;
 
   const [nx, ny] = normalize(dx, dy);
+  if (nx !== 0 || ny !== 0) npcMarkPlayerAction();
   moveWithCollision(state.player, nx * state.player.speed * dt, ny * state.player.speed * dt);
   state.player.attackCd = Math.max(0, state.player.attackCd - dt);
   state.player.shieldCd = Math.max(0, state.player.shieldCd - dt);
@@ -669,7 +805,30 @@ function allyConfig() {
   return { attackRange: 0, kiteRange: 0, interval: 0.75, speedMul: 1.0, damage: 10 };
 }
 
-// APPROACH 阶段：按节流策略重规划到目标的 A* 路径
+// 在敌人环带上选 A* 可达、有 LOS 的交战锚点（寻路终点，非敌人中心）
+function findEngagePoint(target, cfg) {
+  const ally = state.ally;
+  const lo = cfg.kiteRange + 5;
+  const hi = cfg.attackRange * 0.95;
+  let best = null;
+  let bestScore = Infinity;
+  for (let i = 0; i < 16; i += 1) {
+    const angle = (2 * Math.PI * i) / 16;
+    for (const r of [lo, (lo + hi) * 0.5, hi]) {
+      const px = target.x + Math.cos(angle) * r;
+      const py = target.y + Math.sin(angle) * r;
+      if (px < ally.radius || px > canvas.width - ally.radius) continue;
+      if (py < ally.radius || py > canvas.height - ally.radius) continue;
+      if (collidesWithObstacle(px, py, ally.radius)) continue;
+      if (!_rlHasLOS(px, py, target.x, target.y)) continue;
+      const score = Math.hypot(px - ally.x, py - ally.y);
+      if (score < bestScore) { bestScore = score; best = { x: px, y: py }; }
+    }
+  }
+  return best || { x: target.x, y: target.y };
+}
+
+// APPROACH 阶段：按节流策略重规划到交战锚点的 A* 路径
 function maybeReplanNav(target, dt) {
   const a = state.ally;
   a.navReplanCd -= dt;
@@ -703,47 +862,60 @@ function updateAlly(dt) {
     }
 
   } else if (state.ally.stance === "assault") {
-    // 触发懒加载（首次进入 assault 时）
     if (_rlLoadState === "idle") _rlLoadModel();
 
-    // 目标 = LOS 加权最近敌人（与 RL obs / 攻击 / env 统一）
     const target = _rlNearestEnemy();
     if (target) {
       const d   = distance(state.ally, target);
       const los = _rlHasLOS(state.ally.x, state.ally.y, target.x, target.y);
+      const inEnvelope = d <= cfg.attackRange * _COMBAT_EXIT_DIST_MUL;
+
+      state.ally.losStableFrames = los ? state.ally.losStableFrames + 1 : 0;
+      state.ally.losLostFrames   = los ? 0 : state.ally.losLostFrames + 1;
+
+      const engagePt = findEngagePoint(target, cfg);
+      state.ally.engagePoint = engagePt;
+      const atEngage = distance(state.ally, engagePt) < _ENGAGE_POINT_REACH;
+      const pathNearlyDone = !state.ally.navPath || state.ally.navPath.length <= 2;
 
       if (state.ally.combatPhase === "approach") {
-        // ── A* 寻路接近（无模型依赖）───────────────────────────────────────
-        maybeReplanNav(target, dt);
+        // ── APPROACH：A* 绕障接近交战锚点，到位且 LOS 稳定后把控制权交给 RL ──
+        maybeReplanNav(engagePt, dt);
         const [mx, my] = state.ally.navPath
           ? steerAlong(state.ally.navPath, state.ally, state.obstacles, state.ally.radius)
           : [0, 0];
         moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
 
-        // 交接 → COMBAT：进入射程 + 视线通畅 + 模型就绪
-        if (d <= cfg.attackRange && los && _rlLoadState === "ready") {
-          _rlResetLstmState();              // 新交战 = 新 episode，重置 LSTM
+        const canEnterCombat = d <= cfg.attackRange
+          && state.ally.losStableFrames >= _COMBAT_ENTER_LOS_FRAMES
+          && _rlLoadState === "ready"
+          && (atEngage || pathNearlyDone);
+
+        if (canEnterCombat) {
+          _rlResetLstmState();
           state.ally.combatPhase = "combat";
-          state.ally.losLostFrames = 0;
           state.ally.navPath = null;
+          state.ally.losLostFrames = 0;
         }
 
       } else {
-        // ── RL 战斗微操（无规则兜底）──────────────────────────────────────
-        // 提交本帧观测，下帧使用（滞后 1 帧，< 16ms，完全可接受）
+        // ── COMBAT：RL 全权走位/风筝/躲弹（1c：已废除 hold 站桩）─────────────
         _rlInferAsync(state.ally.attackCd);
-        const [mx, my] = _RL_ACTION_VECTORS[_rlLastAction];
+        const minTtaSec = _rlMinBulletTTASec();
+        const action = _rlResolveAction(los, minTtaSec);
+        const [mx, my] = _RL_ACTION_VECTORS[action];
         moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
 
-        // 交回 → APPROACH：脱离射程(迟滞×1.3) 或 视线持续丢失
-        state.ally.losLostFrames = los ? 0 : state.ally.losLostFrames + 1;
-        if (d > cfg.attackRange * 1.3 || state.ally.losLostFrames >= 12) {
+        // 退出 COMBAT 仅两种情况，均回 approach 用 A* 移动重定位（绝不站桩）：
+        //   ① 脱离交战包络（敌人跑远，!inEnvelope）
+        //   ② 被障碍长期(≥0.4s)隔断视线；瞬时遮挡不退出，交给 RL 自己走出墙缝
+        if (!inEnvelope || state.ally.losLostFrames >= _COMBAT_LOS_LOST_EXIT_FRAMES) {
           state.ally.combatPhase = "approach";
           state.ally.navPath = null;
+          state.ally.losLostFrames = 0;
         }
       }
 
-      // 自动开火：两阶段共用，目标统一为 LOS 加权最近敌人
       if (state.ally.attackCd <= 0) {
         state.allyBullets.push(createBullet("ally", state.ally, target, 400, cfg.damage));
         state.ally.attackCd = cfg.interval;
@@ -1094,6 +1266,506 @@ function updateHud() {
     `${floorName}（第 ${state.floor} 层） | 玩家 HP ${Math.floor(state.player.hp)} | 乌枭 HP ${Math.floor(state.ally.hp)} | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}`;
 }
 
+// ── NPC 对话与自主思考 ────────────────────────────────────────────────────────
+
+const NPC_ID   = "wuxiao_01";
+const NPC_NAME = "乌枭";
+const NPC_DISPLAY_NAME = "乌枭";
+const STANCE_LABELS = { assault: "突击", guard: "守护" };
+
+const NPC_AUTONOMY = {
+  enabled: true,
+  idleThresholdMs: 8000,
+  thinkIntervalMs: 12000,
+  speechCooldownMs: 15000,
+  socialBeatMs: 45000,
+  periodicFallbackMs: 75000,
+  playerIdleForHelpMs: 8000,
+  allyCriticalPct: 0.25,
+  playerDangerPct: 0.30,
+};
+
+const npcIO = {
+  busy: false,
+  mode: null,
+  abortCtrl: null,
+  currentPriority: 99,
+  combatMood: "observing",
+  lastPlayerMsgAt: 0,
+  lastPlayerActionAt: 0,
+  lastThinkCompletedAt: 0,
+  lastNpcSpeechAt: 0,
+  lastSceneHash: "",
+  prevEnemyCount: -1,
+  prevPlayerHp: -1,
+  prevAllyHp: -1,
+  autonomyStartAt: 0,
+  lastPlayerHpDropAt: 0,
+  lastStanceChangeAt: 0,
+  openingThinkDone: false,
+  consecutiveNoop: 0,
+  skipLogAt: 0,
+  events: [],
+};
+
+function npcPushEvent(kind, data = {}) {
+  npcIO.events.push({ kind, at: performance.now(), ...data });
+  if (npcIO.events.length > 12) npcIO.events.shift();
+}
+
+function npcRecentEventKinds(maxAgeMs = 12000) {
+  const now = performance.now();
+  return npcIO.events
+    .filter((e) => now - e.at < maxAgeMs)
+    .map((e) => e.kind);
+}
+
+function npcMarkPlayerAction() {
+  npcIO.lastPlayerActionAt = performance.now();
+}
+
+function npcSceneHash() {
+  const s = buildSceneInfo("autonomous");
+  return `${s.floor}|${s.player_hp}|${s.ally_hp}|${s.enemy_count}|${s.ally_stance}|${s.floor_state}|${s.boss_alive}`;
+}
+
+function npcSinceLastSpeechS(now = performance.now()) {
+  if (npcIO.lastNpcSpeechAt > 0) return (now - npcIO.lastNpcSpeechAt) / 1000;
+  if (npcIO.autonomyStartAt > 0) return (now - npcIO.autonomyStartAt) / 1000;
+  return 999;
+}
+
+function npcBulletThreatCount(entity, maxDist = 150, maxTta = 1.5) {
+  let n = 0;
+  for (const b of state.enemyBullets) {
+    if (Math.hypot(b.x - entity.x, b.y - entity.y) > maxDist) continue;
+    if (_rlBulletTTASec(b, entity) <= maxTta) n += 1;
+  }
+  return n;
+}
+
+function npcBuildTacticalContext() {
+  const [playerNearest, playerNearestDist] = findNearestEnemy(state.player);
+  const [allyNearest, allyNearestDist] = state.ally.hp > 0
+    ? findNearestEnemy(state.ally)
+    : [null, -1];
+  const now = performance.now();
+  const playerLos = !playerNearest
+    || _rlHasLOS(state.player.x, state.player.y, playerNearest.x, playerNearest.y);
+  const allyLos = !allyNearest
+    || _rlHasLOS(state.ally.x, state.ally.y, allyNearest.x, allyNearest.y);
+  const incomingPlayer = npcBulletThreatCount(state.player);
+  const incomingAlly = state.ally.hp > 0 ? npcBulletThreatCount(state.ally) : 0;
+  const enemiesInPlayerRange = state.enemies.filter((e) => distance(state.player, e) <= 200).length;
+  const enemiesInAllyRange = state.ally.hp > 0
+    ? state.enemies.filter((e) => distance(state.ally, e) <= 150).length
+    : 0;
+  const allyNavStuck = state.ally.stance === "assault"
+    && state.ally.combatPhase === "approach"
+    && !state.ally.navPath
+    && allyNearestDist > 100;
+  return {
+    nearest_enemy_distance: playerNearest ? Math.round(playerNearestDist) : -1,
+    ally_nearest_enemy_distance: allyNearest ? Math.round(allyNearestDist) : -1,
+    player_has_los: playerLos,
+    ally_has_los: allyLos,
+    los_blocked: !!(playerNearest && (!playerLos || !allyLos)),
+    incoming_bullets_player: incomingPlayer,
+    incoming_bullets_ally: incomingAlly,
+    enemies_in_player_range: enemiesInPlayerRange,
+    enemies_in_ally_range: enemiesInAllyRange,
+    ally_nav_stuck: allyNavStuck,
+    player_under_fire: npcIO.lastPlayerHpDropAt > 0 && (now - npcIO.lastPlayerHpDropAt) < 6000,
+  };
+}
+
+function npcInitAutonomy() {
+  const t = performance.now();
+  npcIO.lastPlayerMsgAt = t;
+  npcIO.lastPlayerActionAt = t;
+  npcIO.autonomyStartAt = t;
+  npcIO.lastThinkCompletedAt = 0;
+  npcIO.lastNpcSpeechAt = 0;
+  npcIO.lastPlayerHpDropAt = 0;
+  npcIO.lastStanceChangeAt = t;
+  npcIO.lastSceneHash = npcSceneHash();
+  npcIO.prevEnemyCount = state.enemies.length;
+  npcIO.prevPlayerHp = Math.floor(state.player.hp);
+  npcIO.prevAllyHp = Math.floor(state.ally.hp);
+  npcIO.consecutiveNoop = 0;
+  npcIO.combatMood = "observing";
+  npcIO.openingThinkDone = false;
+  npcIO.events = [];
+}
+
+function npcTrackHpEvents() {
+  const playerHp = Math.floor(state.player.hp);
+  const allyHp = Math.floor(state.ally.hp);
+  if (npcIO.prevPlayerHp >= 0 && playerHp < npcIO.prevPlayerHp - 15) {
+    npcIO.lastPlayerHpDropAt = performance.now();
+    npcPushEvent("hp_drop", { who: "player", from: npcIO.prevPlayerHp, to: playerHp });
+  }
+  if (npcIO.prevAllyHp >= 0 && allyHp < npcIO.prevAllyHp - 15) {
+    npcPushEvent("hp_drop", { who: "ally", from: npcIO.prevAllyHp, to: allyHp });
+  }
+  npcIO.prevPlayerHp = playerHp;
+  npcIO.prevAllyHp = allyHp;
+}
+
+function npcSkipLog(reason) {
+  const now = performance.now();
+  if (now - npcIO.skipLogAt < 3000) return;
+  npcIO.skipLogAt = now;
+  console.info("[NPC] think skipped:", reason);
+}
+
+function buildSceneInfo(trigger = "reactive") {
+  const playerHp = Math.floor(state.player.hp);
+  const allyHp = Math.floor(state.ally.hp);
+  const now = performance.now();
+  const playerActionS = (now - npcIO.lastPlayerActionAt) / 1000;
+  const playerHpPct = playerHp / state.player.maxHp;
+  const allyHpPct = allyHp / state.ally.maxHp;
+  const allyPlayerDist = Math.round(distance(state.ally, state.player));
+  const allyNearPlayer = allyPlayerDist <= 80;
+  const allyGuardingPlayer = state.ally.stance === "guard" && allyNearPlayer;
+  const tactical = npcBuildTacticalContext();
+  return {
+    mode: "battle",
+    floor: state.floor,
+    floor_state: state.floorState,
+    ally_stance: state.ally.stance,
+    ally_combat_phase: state.ally.combatPhase,
+    ally_player_distance: allyPlayerDist,
+    ally_near_player: allyNearPlayer,
+    ally_already_guarding: allyGuardingPlayer,
+    player_hp: playerHp,
+    player_hp_pct: playerHpPct,
+    player_max_hp: state.player.maxHp,
+    ally_hp: allyHp,
+    ally_hp_pct: allyHpPct,
+    ally_max_hp: state.ally.maxHp,
+    enemy_count: state.enemies.length,
+    prev_enemy_count: npcIO.prevEnemyCount,
+    boss_alive: state.bossAlive,
+    player_last_action_s: playerActionS,
+    player_is_active: playerActionS < 6,
+    player_is_idle: playerActionS >= NPC_AUTONOMY.playerIdleForHelpMs / 1000,
+    ally_guard_duration_s: state.ally.stance === "guard"
+      ? (now - npcIO.lastStanceChangeAt) / 1000
+      : 0,
+    ally_in_danger: allyHpPct <= NPC_AUTONOMY.allyCriticalPct,
+    player_in_danger: playerHpPct <= NPC_AUTONOMY.playerDangerPct,
+    recent_events: npcRecentEventKinds(),
+    trigger,
+    idle_seconds: trigger === "autonomous" ? (now - npcIO.lastPlayerMsgAt) / 1000 : 0,
+    since_last_npc_speech: npcSinceLastSpeechS(now),
+    ...tactical,
+  };
+}
+
+function npcStartRequest(mode, priority = 99) {
+  if (mode === "chat" && npcIO.mode === "think") npcIO.abortCtrl?.abort();
+  if (mode === "think" && npcIO.mode === "think" && priority < npcIO.currentPriority) {
+    npcIO.abortCtrl?.abort();
+  }
+  npcIO.busy = true;
+  npcIO.mode = mode;
+  npcIO.currentPriority = priority;
+  npcIO.abortCtrl = new AbortController();
+  return npcIO.abortCtrl;
+}
+
+function npcEndRequest(mode) {
+  if (npcIO.mode === mode) {
+    npcIO.busy = false;
+    npcIO.mode = null;
+    npcIO.abortCtrl = null;
+  }
+}
+
+function npcMarkSpeech() {
+  npcIO.lastNpcSpeechAt = performance.now();
+}
+
+function applyStance(stance, reply, opts = {}) {
+  if (!stance) return;
+  if (stance === "assault" && state.ally.dead) return;
+  const stanceChanged = opts.stanceChanged !== undefined
+    ? opts.stanceChanged
+    : state.ally.stance !== stance;
+  if (stance === "assault" && stanceChanged) {
+    state.ally.combatPhase = "approach";
+    state.ally.navPath = null;
+    state.ally.engagePoint = null;
+    state.ally.losStableFrames = 0;
+    state.ally.losLostFrames = 0;
+    if (_rlLoadState === "ready") _rlResetLstmState();
+  }
+  state.ally.stance = stance;
+  const label = STANCE_LABELS[stance] || stance;
+  const bubble = reply || `姿态切换：${label}。`;
+  setAllyBubble(bubble);
+  if (stanceChanged || !opts.autonomous) {
+    appendMessage("npc", bubble);
+    npcMarkSpeech();
+    if (stanceChanged) npcIO.lastStanceChangeAt = performance.now();
+  }
+}
+
+async function consumeNpcStream(body, opts = {}) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let msgNode = null;
+  let accumulated = "";
+  let buffer = "";
+  let bubbleThrottle = 0;
+  let outcome = "unknown";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let evt;
+      try { evt = JSON.parse(trimmed); } catch { continue; }
+
+      if (evt.type === "meta") {
+        if (evt.combat_mood) npcIO.combatMood = evt.combat_mood;
+        continue;
+      }
+      if (evt.type === "noop") {
+        outcome = "noop";
+        continue;
+      }
+      if (evt.type === "command") {
+        outcome = `command:${evt.stance}:${evt.reply || ""}`;
+        applyStance(evt.stance, evt.reply, {
+          autonomous: opts.source === "autonomous",
+          stanceChanged: evt.stance_changed !== false,
+        });
+      } else if (evt.type === "delta") {
+        outcome = "dialogue(streaming)";
+        if (!msgNode) msgNode = appendStreamingNpcMessage();
+        accumulated += evt.text;
+        msgNode.append(evt.text);
+        const now = Date.now();
+        if (now - bubbleThrottle > 100) { setAllyBubble(accumulated); bubbleThrottle = now; }
+      } else if (evt.type === "done") {
+        const finalText = evt.action?.dialogue || accumulated || "收到，我会继续和你协同。";
+        const emotion = evt.action?.emotion || "neutral";
+        outcome = `dialogue:${finalText}`;
+        if (msgNode) msgNode.finish(finalText, emotion);
+        else appendMessage("npc", finalText);
+        setAllyBubble(`${emotionKaomoji(emotion)} ${finalText}`);
+        npcMarkSpeech();
+      } else if (evt.type === "polish") {
+        const polished = evt.dialogue || "";
+        if (polished) {
+          outcome = `polish:${polished}`;
+          setAllyBubble(`${emotionKaomoji(evt.emotion || "focused")} ${polished}`);
+        }
+      } else if (evt.type === "error") {
+        const fallbackText = evt.fallback?.dialogue || "连接中断。我会继续执行上一条指令。";
+        outcome = `error:${fallbackText}`;
+        if (msgNode) msgNode.finish(fallbackText, "neutral");
+        else appendMessage("npc", fallbackText);
+        setAllyBubble(fallbackText);
+        npcMarkSpeech();
+      }
+    }
+  }
+
+  if (opts.source === "autonomous") {
+    if (outcome === "noop") npcIO.consecutiveNoop += 1;
+    else npcIO.consecutiveNoop = 0;
+    console.info("[NPC] think response:", outcome);
+  }
+  return outcome;
+}
+
+function npcNoopBackoffMs() {
+  const steps = [15000, 30000, 60000];
+  const idx = Math.min(Math.max(0, npcIO.consecutiveNoop - 2), steps.length - 1);
+  return npcIO.consecutiveNoop >= 2 ? steps[idx] : 0;
+}
+
+function npcEvaluateTriggers() {
+  if (!NPC_AUTONOMY.enabled) return null;
+  if (state.result || state.ally.dead) return null;
+
+  const now = performance.now();
+  const scene = buildSceneInfo("autonomous");
+  const hash = npcSceneHash();
+  const events = npcRecentEventKinds();
+
+  if (events.includes("floor_clear") && state.floorState === "clear") {
+    return {
+      priority: 1,
+      trigger: "scene_change",
+      reason: "floor_clear",
+      scene_change_kind: "floor_clear",
+    };
+  }
+
+  if (state.floorState !== "playing") return null;
+
+  if (
+    !npcIO.openingThinkDone
+    && now - npcIO.autonomyStartAt < 25000
+    && scene.enemy_count > 0
+    && scene.ally_stance === "guard"
+    && now - npcIO.lastPlayerMsgAt >= NPC_AUTONOMY.idleThresholdMs
+  ) {
+    npcIO.openingThinkDone = true;
+    return {
+      priority: 1,
+      trigger: "scene_change",
+      reason: "opening",
+      scene_change_kind: "opening",
+    };
+  }
+
+  if (scene.ally_hp_pct <= 0.10) {
+    return { priority: 0, trigger: "critical", reason: "ally_dire" };
+  }
+  if (scene.ally_in_danger) {
+    return { priority: 0, trigger: "critical", reason: "ally_critical" };
+  }
+  if (scene.player_in_danger && scene.ally_stance === "assault") {
+    return { priority: 0, trigger: "critical", reason: "player_danger_assault" };
+  }
+  if (scene.player_in_danger && scene.player_is_idle) {
+    return { priority: 0, trigger: "critical", reason: "player_idle_danger" };
+  }
+
+  if (events.includes("floor_enter") || hash !== npcIO.lastSceneHash) {
+    const ecDelta = npcIO.prevEnemyCount >= 0
+      ? scene.enemy_count - npcIO.prevEnemyCount
+      : 0;
+    if (events.includes("floor_enter") || Math.abs(ecDelta) >= 2) {
+      return {
+        priority: 1,
+        trigger: "scene_change",
+        reason: events.includes("floor_enter") ? "floor_enter" : "enemy_delta",
+        scene_change_kind: events.includes("floor_enter") ? "floor_enter" : "enemy_change",
+      };
+    }
+  }
+
+  if (npcSinceLastSpeechS(now) * 1000 >= NPC_AUTONOMY.socialBeatMs) {
+    if (now - npcIO.lastPlayerMsgAt >= NPC_AUTONOMY.idleThresholdMs) {
+      return { priority: 2, trigger: "social", reason: "social_beat" };
+    }
+  }
+
+  if (now - npcIO.lastPlayerMsgAt < NPC_AUTONOMY.idleThresholdMs) return null;
+
+  if (npcIO.lastThinkCompletedAt && now - npcIO.lastThinkCompletedAt < NPC_AUTONOMY.thinkIntervalMs) {
+    return null;
+  }
+  const backoff = npcNoopBackoffMs();
+  if (backoff && npcIO.lastThinkCompletedAt && now - npcIO.lastThinkCompletedAt < backoff) {
+    return null;
+  }
+  if (!npcIO.lastThinkCompletedAt
+      || now - npcIO.lastThinkCompletedAt >= NPC_AUTONOMY.periodicFallbackMs) {
+    return { priority: 3, trigger: "periodic", reason: "periodic_fallback" };
+  }
+  return null;
+}
+
+function npcEnqueueThink(evaluation) {
+  if (!evaluation) return;
+  if (npcIO.busy && evaluation.priority >= npcIO.currentPriority) {
+    npcSkipLog(`busy_block_p${evaluation.priority}`);
+    return;
+  }
+
+  const ctrl = npcStartRequest("think", evaluation.priority);
+  const scene = buildSceneInfo("autonomous");
+  scene.scene_hash = npcSceneHash();
+  scene.scene_change_kind = evaluation.scene_change_kind || "";
+  scene.trigger_reason = evaluation.reason;
+  console.info("[NPC] think", evaluation.trigger, evaluation);
+
+  fetch(`${NPC_API}/api/npc/think`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: ctrl.signal,
+    body: JSON.stringify({
+      player_id: state.playerId,
+      npc_id: NPC_ID,
+      npc_name: NPC_NAME,
+      trigger: evaluation.trigger,
+      priority: evaluation.priority,
+      trigger_reason: evaluation.reason,
+      scene_info: scene,
+    }),
+  })
+    .then((resp) => {
+      if (!resp.ok || !resp.body) throw new Error(`think failed: HTTP ${resp.status}`);
+      return consumeNpcStream(resp.body, { source: "autonomous" });
+    })
+    .catch((err) => {
+      if (err.name === "AbortError") return;
+      console.warn("[NPC] think error:", err);
+    })
+    .finally(() => {
+      npcIO.lastThinkCompletedAt = performance.now();
+      npcIO.prevEnemyCount = state.enemies.length;
+      npcIO.lastSceneHash = npcSceneHash();
+      npcIO.currentPriority = 99;
+      npcEndRequest("think");
+    });
+}
+
+function npcTickAutonomy() {
+  if (state.floorState === "playing" && !state.result && !state.ally.dead) {
+    npcTrackHpEvents();
+  }
+  const evaluation = npcEvaluateTriggers();
+  if (evaluation) npcEnqueueThink(evaluation);
+}
+
+async function sendPlayerChat(message) {
+  npcIO.lastPlayerMsgAt = performance.now();
+  const ctrl = npcStartRequest("chat");
+
+  const payload = {
+    player_id: state.playerId,
+    npc_id: NPC_ID,
+    npc_name: NPC_NAME,
+    message,
+    scene_info: buildSceneInfo("reactive"),
+  };
+
+  try {
+    const resp = await fetch(`${NPC_API}/api/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok || !resp.body) throw new Error(`chat failed: ${resp.status}`);
+    await consumeNpcStream(resp.body, { source: "reactive" });
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    const text = "连接中断。我会继续执行上一条指令。";
+    appendMessage("npc", text);
+    setAllyBubble(text);
+    npcMarkSpeech();
+  } finally {
+    npcEndRequest("chat");
+  }
+}
+
 // ── 主循环 ────────────────────────────────────────────────────────────────────
 
 let lastTs = performance.now();
@@ -1124,114 +1796,17 @@ document.addEventListener("keydown", (e) => {
 });
 document.addEventListener("keyup", (e) => { state.keys[e.code] = false; });
 
-// ── NPC 对话 ──────────────────────────────────────────────────────────────────
-
-const NPC_ID   = "wuxiao_01";
-const NPC_NAME = "乌枭";
-const NPC_DISPLAY_NAME = "乌枭";
-const STANCE_LABELS = { assault: "突击", guard: "守护" };
-
-function buildSceneInfo() {
-  return {
-    mode:        "battle",
-    floor:       state.floor,
-    ally_stance: state.ally.stance,
-    player_hp:   Math.floor(state.player.hp),
-    ally_hp:     Math.floor(state.ally.hp),
-    enemy_count: state.enemies.length,
-    boss_alive:  state.bossAlive,
-  };
-}
-
-function applyStance(stance, reply) {
-  if (!stance) return;
-  // 客户端保底：NPC 无血时不允许切突击（正常情况由后端拦截并给出回复）
-  if (stance === "assault" && state.ally.dead) return;
-  // 切到突击 = 新的决策 episode：先寻路接近，重置 LSTM hidden state 与 FSM
-  if (stance === "assault") {
-    state.ally.combatPhase = "approach";
-    state.ally.navPath = null;
-    state.ally.losLostFrames = 0;
-    if (_rlLoadState === "ready") _rlResetLstmState();
-  }
-  state.ally.stance = stance;
-  const label  = STANCE_LABELS[stance] || stance;
-  const bubble = reply || `姿态切换：${label}。`;
-  setAllyBubble(bubble);
-  appendMessage("npc", bubble);
-}
-
 chatForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const message = chatInput.value.trim();
   if (!message) return;
   chatInput.value = "";
   appendMessage("player", message);
-
-  const payload = {
-    player_id:  state.playerId,
-    npc_id:     NPC_ID,
-    npc_name:   NPC_NAME,
-    message,
-    scene_info: buildSceneInfo(),
-  };
-
-  try {
-    const resp = await fetch(`${NPC_API}/api/chat/stream`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(payload),
-    });
-
-    const reader  = resp.body.getReader();
-    const decoder = new TextDecoder();
-
-    let msgNode       = null;
-    let accumulated   = "";
-    let buffer        = "";
-    let bubbleThrottle = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let evt;
-        try { evt = JSON.parse(trimmed); } catch { continue; }
-
-        if (evt.type === "command") {
-          applyStance(evt.stance, evt.reply);
-        } else if (evt.type === "delta") {
-          if (!msgNode) msgNode = appendStreamingNpcMessage();
-          accumulated += evt.text;
-          msgNode.append(evt.text);
-          const now = Date.now();
-          if (now - bubbleThrottle > 100) { setAllyBubble(accumulated); bubbleThrottle = now; }
-        } else if (evt.type === "done") {
-          const finalText = evt.action?.dialogue || accumulated || "收到，我会继续和你协同。";
-          const emotion   = evt.action?.emotion  || "neutral";
-          if (msgNode) msgNode.finish(finalText, emotion);
-          setAllyBubble(`${emotionKaomoji(emotion)} ${finalText}`);
-        } else if (evt.type === "error") {
-          const fallbackText = evt.fallback?.dialogue || "连接中断。我会继续执行上一条指令。";
-          if (msgNode) msgNode.finish(fallbackText, "neutral");
-          else appendMessage("npc", fallbackText);
-          setAllyBubble(fallbackText);
-        }
-      }
-    }
-  } catch (err) {
-    const text = "连接中断。我会继续执行上一条指令。";
-    appendMessage("npc", text);
-    setAllyBubble(text);
-  }
+  await sendPlayerChat(message);
 });
 
 appendMessage("npc", "黑签鬼差乌枭到位。你别乱送，我就能把你带到无间边狱。");
+npcInitAutonomy();
+console.info(`[NPC] autonomy9 loaded — assault rules + tactical context`);
+setInterval(npcTickAutonomy, 1000);
 requestAnimationFrame(loop);

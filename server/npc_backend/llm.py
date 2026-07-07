@@ -71,6 +71,63 @@ def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
             yield delta
 
 
+def autonomous_decide(
+    *,
+    npc_name: str,
+    scene_info: dict[str, Any],
+    world_chunks: list[str],
+    persona_chunks: list[str],
+    dialogue_daily_chunks: list[str],
+    dialogue_important_chunks: list[str],
+    short_term_history: list[dict[str, Any]],
+    narrative_context: dict[str, str] | None = None,
+    allowed_intents: list[str] | None = None,
+    trigger: str = "periodic",
+) -> dict[str, Any]:
+    """
+    自主思考：根据局面决定 noop / command / dialogue。
+
+    返回：
+      - {"type": "noop"}
+      - {"type": "command", "stance": "guard|assault", "reply": "..."}
+      - {"type": "dialogue", "reply": "..."}
+    """
+    from server.npc_backend.prompts import build_autonomous_decide_messages
+
+    messages = build_autonomous_decide_messages(
+        npc_name=npc_name,
+        scene_info=scene_info,
+        world_chunks=world_chunks,
+        persona_chunks=persona_chunks,
+        dialogue_daily_chunks=dialogue_daily_chunks,
+        dialogue_important_chunks=dialogue_important_chunks,
+        short_term_history=short_term_history,
+        narrative_context=narrative_context,
+        allowed_intents=allowed_intents,
+        trigger=trigger or str(scene_info.get("trigger", "periodic")),
+    )
+    try:
+        raw = chat_completion(messages)
+        stripped = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        data: dict[str, Any] = json.loads(stripped)
+        decision_type = str(data.get("type", "")).strip()
+        if decision_type == "noop":
+            return {"type": "noop"}
+        if decision_type == "command":
+            stance = str(data.get("stance", "")).strip()
+            if stance not in VALID_STANCES:
+                raise ValueError(f"invalid stance: {stance}")
+            reply = str(data.get("reply", _STANCE_REPLIES.get(stance, "收到。"))).strip()
+            return {"type": "command", "stance": stance, "reply": reply}
+        if decision_type == "dialogue":
+            reply = str(data.get("reply", "")).strip()
+            if reply:
+                return {"type": "dialogue", "reply": reply}
+    except Exception:
+        pass
+    return {"type": "noop"}
+
+
 def classify_intent(
     *,
     message: str,

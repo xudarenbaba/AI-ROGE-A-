@@ -173,6 +173,10 @@ _RAY_DIRS = [
 
 MAX_BULLET_DIST = 200.0  # 超出此范围的子弹视为无威胁
 
+# v4 躲弹强化：稠密弹道威胁阈值（归一化 tta，×BULLET_TTL≈0.77s）。
+# 会命中 ally 且归一化 tta < 此值的敌弹，按逼近程度每帧持续扣分（见 _compute_reward 段4）。
+_THREAT_TTA_NORM = 0.35
+
 
 # ── 数据类 ────────────────────────────────────────────────────────────────────
 
@@ -301,21 +305,30 @@ def _raycast_obstacle(ox: float, oy: float,
 
 def _bullet_time_to_ally(b: Bullet, ally: Entity) -> float:
     """
-    估算子弹到达 ally 的时间（秒）。
-    用子弹速度方向的投影距离计算，负值表示子弹已飞过或背向。
-    返回归一化到 [0,1] 的值：= max(0, tta) / BULLET_TTL。
+    圆盘碰撞 TTA（秒），归一化到 [0,1]（÷ BULLET_TTL）。
+    未命中、背向或超出 TTL 返回 1.0（与 game.js _rlBulletTTA 对齐）。
     """
-    dx = ally.x - b.x
-    dy = ally.y - b.y
-    spd = math.hypot(b.vx, b.vy)
-    if spd < 1e-6:
+    rx = ally.x - b.x
+    ry = ally.y - b.y
+    vx, vy = b.vx, b.vy
+    v2 = vx * vx + vy * vy
+    if v2 < 1e-6:
         return 1.0
-    # 子弹速度方向上的投影距离
-    proj = (dx * b.vx + dy * b.vy) / spd
-    if proj <= 0:
-        return 1.0  # 子弹背向 ally
-    tta = proj / spd
-    return min(1.0, max(0.0, tta / BULLET_TTL))
+    hit_r = ally.radius + b.radius
+    a = v2
+    b_coef = 2.0 * (rx * vx + ry * vy)
+    c = rx * rx + ry * ry - hit_r * hit_r
+    disc = b_coef * b_coef - 4.0 * a * c
+    if disc < 0:
+        return 1.0
+    sqrt_disc = math.sqrt(disc)
+    t_hit: float | None = None
+    for t in ((-b_coef - sqrt_disc) / (2.0 * a), (-b_coef + sqrt_disc) / (2.0 * a)):
+        if t >= 0 and (t_hit is None or t < t_hit):
+            t_hit = t
+    if t_hit is None or t_hit > b.ttl:
+        return 1.0
+    return min(1.0, max(0.0, t_hit / BULLET_TTL))
 
 
 # ── 环境主体 ──────────────────────────────────────────────────────────────────
@@ -628,28 +641,26 @@ class AssaultEnv(gym.Env):
         min_bullet_tta: float,
     ) -> float:
         """
-        战斗专家奖励（导航交给 A*，此处只评射程内战斗微操）：
+        战斗专家奖励（v4 躲弹强化版）。相对 v3 的关键改动：
+          + 段4 稠密弹道威胁惩罚：站在会命中的敌弹路径上每帧持续扣分，越逼近越疼，
+            移出弹道立刻止损 —— 为“往哪躲”提供稠密梯度（v3 只有挨弹瞬间的稀疏负反馈）
+          + 段4 危险时主动机动奖励：有威胁且移动给正奖励，打破静止惯性
+          ↑ 段2 被命中惩罚 0.25 → 0.6（挨弹要显著比少打亏）
+          − 删除 v3 的“安全奖励静止”（不再奖励不动，走位/风筝交给策略）
+          ~ 段8 站桩惩罚改温和无条件（豁免 30 帧、最优位减半）
+        段1 伤害 / 段3 最优射程位 / 段9 胜负锚点维持，避免训练出只躲不打的怂包。
 
-        1.  伤害奖励
-        2.  受伤惩罚
-        3.  射程区间 × LOS（最优攻击位 / 过近 / 遮挡）
-        4.  持续机动奖励（每帧非静止给微小正奖励，打破站桩吸引子）
-        5.  子弹危险时主动闪避奖励
-        6.  LOS 遮挡开火惩罚
-        7.  动作平滑惩罚
-        8.  连续静止惩罚（豁免期从 45 帧压缩到 20 帧，且最优位不完全豁免）
-        9.  死亡惩罚 / 胜利奖励
-        10. 时间惩罚
-        （脱离交战包络的截断惩罚在 step() 末尾处理）
+        段位：1伤害 2受伤 3射程×LOS 4弹道威胁&机动 6遮挡开火 7动作平滑
+              8连续静止 9死亡/胜利 10时间。（参数 min_bullet_tta 现由段4 自行遍历，保留以兼容签名）
         """
         reward = 0.0
         ally   = self._ally
 
-        # 1. 伤害奖励
+        # 1. 伤害奖励（锚住输出动机）
         reward += damage_dealt * 0.08
 
-        # 2. 受伤惩罚
-        reward -= hp_lost * 0.15
+        # 2. 被命中惩罚（加重：挨弹要显著比少打亏）
+        reward -= hp_lost * 0.6
 
         # 3. 射程区间 × LOS：维持 [kite, attack] 攻击位且视线通畅
         in_optimal_pos = False
@@ -668,34 +679,37 @@ class AssaultEnv(gym.Env):
             elif dist_now < 130.0:
                 reward += 0.006 if los else -0.008
 
-        # 4. 持续机动奖励：每帧移动（action≠0）都给一个微小正奖励。
-        #    幅度刻意设得比攻击位奖励小一个量级（0.003 vs 0.020），
-        #    让 agent 学到"在最优位走位比在最优位站桩略好"，
-        #    消除"到位即站死"的站桩吸引子，引导持续 kite 行为。
-        if action != 0:
-            reward += 0.003
+        # 4. ★躲弹核心：稠密弹道威胁惩罚 + 危险时主动机动奖励
+        #    threat = Σ 会命中且逼近的敌弹危险度（每颗 [0,1]，越近越大）。
+        #    站在弹道上每帧持续疼 → 移出弹道 threat 下降 → 形成“往哪躲”的稠密梯度。
+        threat = 0.0
+        for b in self._enemy_bullets:
+            tta = _bullet_time_to_ally(b, ally)          # 不会命中的子弹返回 1.0
+            if tta < _THREAT_TTA_NORM:
+                threat += 1.0 - tta / _THREAT_TTA_NORM   # [0,1]
+        if threat > 0.0:
+            reward -= 0.035 * min(threat, 3.0)           # 弹幕封顶，避免数值爆炸
+            if action != 0:                              # 危险时移动 → 打破静止惯性
+                reward += 0.012 * min(threat, 1.0)
 
-        # 5. 子弹危险时额外闪避奖励（叠加在持续机动奖励上）
-        if min_bullet_tta < 0.2 and action != 0:
-            reward += 0.005
-
-        # 6. LOS 遮挡开火惩罚
+        # 6. LOS 遮挡开火惩罚（别隔墙瞎打）
         if fired_without_los:
             reward -= 0.04
 
-        # 7. 动作平滑惩罚（阈值 -0.7，只惩罚近乎完全反向，抑制无效抖动）
+        # 7. 动作平滑惩罚：反向/正交快速切换（反向略放宽，给躲弹变向留空间）
         prev_vec = ACTION_VECTORS[self._prev_action]
         curr_vec = ACTION_VECTORS[action]
         dot = prev_vec[0] * curr_vec[0] + prev_vec[1] * curr_vec[1]
-        if action != 0 and self._prev_action != 0 and dot < -0.7:
-            reward -= 0.005
+        if action != 0 and self._prev_action != 0:
+            if dot < -0.7:
+                reward -= 0.006
+            elif dot < 0.3:
+                reward -= 0.003
 
-        # 8. 连续静止惩罚
-        #    豁免期从 45 → 20 帧（~0.33s）：稍作停顿可以，长时间站桩必须惩罚。
-        #    最优攻击位也只减半惩罚而非完全豁免，防止"到最优位就停"的退化策略。
-        if still_frames > 20:
-            overage = min(still_frames - 20, 100)
-            base_penalty = 0.008 + overage * (0.016 / 100)
+        # 8. 连续静止惩罚：温和无条件，打破安全站桩吸引子（最优位减半）
+        if still_frames > 30:
+            overage = min(still_frames - 30, 120)
+            base_penalty = 0.004 + overage * (0.010 / 120)
             reward -= base_penalty * (0.5 if in_optimal_pos else 1.0)
 
         # 9. 死亡 / 胜利
