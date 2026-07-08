@@ -1,93 +1,21 @@
 # AI Roguelite Web Demo
 
-游戏客户端与 NPC API **完全分离**：`game/` 只负责页面与战斗逻辑，`server/` 只提供 AI 接口（不托管静态文件）。
+《无间行录》网页演示：2D 俯视角 Roguelite 战斗 + 可对话、可自主思考的鬼差同伴「乌枭」。
 
-**特性：**
-
-- 浏览器端 2D 战斗玩法（移动、射击、障碍物掩体、无限关卡）
-- 单 NPC 流式对话后端（Flask + ChromaDB，NDJSON 格式）
-- 通过自然语言控制 NPC 战术姿态（守护 / 突击 / 游击）
-- 记忆系统：短期记忆（会话内） + 长期记忆（ChromaDB 持久化）
-- 意图分类与记忆检索**并行执行**，单次请求完成对话或战术切换
-- NPC 情绪系统（7 种情绪 + 颜文字展示）
-- **突击（assault）姿态**：使用强化学习（PPO）训练的策略网络，浏览器内 ONNX 推理控制 NPC 移动
-
----
+游戏前端（`game/`）与 NPC 后端（`server/`）完全分离：浏览器负责战斗与渲染，Python 服务负责 LLM 对话、战术指令解析和自主决策。
 
 ![模拟游戏界面-1](images/img1.png)
 ![模拟游戏界面-2](images/img2.png)
 
 ---
 
-## 项目目录
-
-```text
-ai-roguelite-web
-├─ run.py                          # 启动 NPC API 服务（端口 5100）
-├─ run_game.py                     # 启动游戏静态文件服务（端口 8081）
-├─ requirements.txt                # Python 依赖（含 RL 训练依赖）
-├─ config.yaml                     # 当前生效配置（gitignored）
-├─ config.example.yaml             # 配置模板
-├─ images/                         # README 截图
-├─ game/                           # 游戏客户端（纯静态，独立于后端）
-│  ├─ index.html
-│  ├─ game.js                      # 游戏逻辑：战斗、NPC 控制、RL 推理
-│  ├─ styles.css
-│  └─ assault_policy.onnx          # RL 训练产出（训练并导出后放入此处）
-├─ rl/                             # 强化学习模块（独立，仅训练时使用）
-│  ├─ env.py                       # gymnasium 环境（精确复刻 game.js 物理）
-│  ├─ train.py                     # PPO 训练脚本
-│  ├─ export_onnx.py               # 导出 ONNX 模型
-│  ├─ checkpoints/                 # 训练检查点（自动创建）
-│  └─ logs/                        # TensorBoard 日志（自动创建）
-├─ lore/
-│  ├─ world_setting.md             # 世界观设定（导入 ChromaDB）
-│  └─ persona_setting.md           # 角色设定（导入 ChromaDB）
-├─ scripts/
-│  ├─ import_world_setting.py
-│  └─ import_persona_setting.py
-└─ server/                         # NPC API（无 static / templates）
-   ├─ app.py                       # Flask 路由（/api/chat/stream、/health）
-   └─ npc_backend/
-      ├─ config.py
-      ├─ schemas.py
-      ├─ short_term.py             # 短期记忆（会话内 deque）
-      ├─ memory.py                 # 长期记忆（ChromaDB）
-      ├─ prompts.py                # Prompt 组装
-      ├─ llm.py                    # LLM 调用：流式、意图分类、记忆分级
-      └─ graph.py                  # NpcConversationEngine：并行意图分类 + 流式对话
-```
-
----
-
-## 架构
-
-```text
-浏览器  http://127.0.0.1:8081
-    │   game/index.html + game.js + styles.css
-    │   （run_game.py 静态托管）
-    │
-    │   ┌── assault 姿态移动 ──▶  onnxruntime-web（浏览器内推理）
-    │   │                         assault_policy.onnx（101维obs → 9动作）
-    │   │
-    └── fetch ──▶  http://127.0.0.1:5100
-                    NPC API（run.py）
-                    └─ POST /api/chat/stream
-                         ├─ 意图分类 LLM  ┐ 并行执行
-                         ├─ 短期记忆检索  │
-                         └─ 长期记忆检索  ┘
-                              │
-                              ├─ command → yield command 事件（前端切姿态）
-                              └─ dialogue → yield delta/done 流式对话
-```
-
-**对话/指令统一走 `/api/chat/stream` 单接口。** 服务端并行启动意图分类和记忆检索，分类完成后：
-- 识别为战术指令 → 直接返回 `command` 事件，记忆检索结果丢弃
-- 识别为对话 → 记忆检索结果（此时大概率已完成）直接用于构建 Prompt，开始流式输出
-
----
-
 ## 快速启动
+
+### 环境要求
+
+- Python 3.10+
+- 可访问的 LLM API（默认配置为 DeepSeek 兼容接口）
+- 现代浏览器（Chrome / Edge / Firefox 等）
 
 ### 1. 安装依赖
 
@@ -95,261 +23,230 @@ ai-roguelite-web
 pip install -r requirements.txt
 ```
 
-> RL 训练依赖（`gymnasium`、`stable-baselines3` 等）包含在 `requirements.txt` 中，
-> 如只运行游戏不需要训练，可跳过这几行单独安装游戏运行依赖。
+### 2. 配置
 
-### 2. 导入基础设定到 ChromaDB（仅首次）
+复制配置模板并填入你的 API Key：
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+编辑 `config.yaml`，至少修改 `llm.api_key`。也可用环境变量覆盖（优先级更高）：
+
+```bash
+export AI_NPC_LLM_API_KEY="sk-xxxx"
+export AI_NPC_LLM_BASE_URL="https://api.deepseek.com"
+export AI_NPC_LLM_MODEL="deepseek-chat"
+```
+
+配置解析顺序（后者覆盖前者）：
+
+1. `server/npc_backend/config.py` 默认值
+2. 项目根目录 `config.yaml`
+3. 环境变量 `AI_NPC_LLM_API_KEY` / `AI_NPC_LLM_BASE_URL` / `AI_NPC_LLM_MODEL`
+
+**嵌入模型说明：** 默认使用 `BAAI/bge-small-zh-v1.5`，缓存目录为 `models/`。若 `embeddings.local_files_only: true`（默认），需事先把模型放到 `models/`，否则启动会失败。首次使用可改为 `local_files_only: false`，让 HuggingFace 自动下载。
+
+### 3. 导入世界观与角色设定（首次运行）
 
 ```bash
 python scripts/import_world_setting.py
 python scripts/import_persona_setting.py --npc-id wuxiao_01
 ```
 
-- 世界观 / 角色设定为**覆盖导入**，重复执行会替换旧数据
-- 对话记忆（`memory_type=dialogue`）为运行时追加，不会被脚本清空
+- 世界观 / 角色设定为覆盖导入，可重复执行
+- 运行中产生的对话记忆由游戏自动追加，不会被脚本清空
+- NPC ID 请使用 **`wuxiao_01`**（与前端硬编码一致）
 
-### 3. 启动 NPC API（终端 1）
+### 4. 启动服务（需要两个终端）
+
+**终端 1 — NPC API：**
 
 ```bash
 python run.py
 ```
 
-监听 `http://0.0.0.0:5100`，提供 `/api/chat/stream`、`/health`。
+监听 `http://127.0.0.1:5100`，提供对话、战术指令和自主思考接口。
 
-### 4. 启动游戏静态服务（终端 2）
+**终端 2 — 游戏页面：**
 
 ```bash
 python run_game.py
 ```
 
-监听 `http://127.0.0.1:8081`，托管 `game/` 目录。
+默认监听 `http://127.0.0.1:8082`（端口可通过参数修改，如 `python run_game.py 8080`）。
 
 ### 5. 打开游戏
 
+浏览器访问：
+
 ```
-http://127.0.0.1:8081
+http://127.0.0.1:8082
 ```
+
+若对话或乌枭自主发言无响应，先确认 NPC API 已启动，并访问 `http://127.0.0.1:5100/health` 应返回 `{"status":"ok"}`。
 
 ---
 
-## 配置说明
+## 玩法介绍
 
-复制 `config.example.yaml` 为 `config.yaml`（已 gitignore）。解析优先级（后者覆盖前者）：
+### 背景
 
-1. `server/npc_backend/config.py` 中的硬编码默认值
-2. `config.yaml`
-3. 环境变量：`AI_NPC_LLM_API_KEY` / `AI_NPC_LLM_BASE_URL` / `AI_NPC_LLM_MODEL`
+你是坠入阴司的魂体，在多层「狱」中向前探索。身边的鬼差**乌枭**嘴臭但靠谱——战斗里他会跟着你打，聊天框里可以用自然语言指挥他，他也会根据战况自己开口。
 
-```bash
-# 示例（macOS/Linux）
-export AI_NPC_LLM_API_KEY="sk-xxxx"
-export AI_NPC_LLM_BASE_URL="https://api.deepseek.com"
-export AI_NPC_LLM_MODEL="deepseek-chat"
-python run.py
-```
+### 操作
 
----
+| 操作 | 按键 |
+|------|------|
+| 移动 | WASD / 方向键 |
+| 射击 | 空格 |
+| 闪避 | Shift |
+| 与乌枭对话 | 右侧聊天框输入后发送 |
 
-## NPC 战术控制
+### 关卡流程
 
-玩家通过自然语言驱动 NPC 姿态，**无需任何按钮**。
+1. **探索狱房**：每层的房间由走廊、战斗房、精英房、Boss 房等组成，清完当前房敌人后门会打开。
+2. **靠门前进**：清房后移动到右侧门边进入下一间。
+3. **镇压 Boss**：每层尽头击败 Boss。
+4. **选择狱印**：Boss 后从三张「狱印」中选一张强化本局，然后进入下一层。
 
-| 玩家输入示例 | 识别结果 | NPC 行为 |
-|---|---|---|
-| "回来保护我" / "别乱跑" | 守护（guard） | 贴近玩家，攻击最近敌人；玩家 HP ≤ 45 时自动救援 |
-| "上去打" / "压制它" | 突击（assault） | **RL 策略网络控制移动**，自动寻路绕障、躲避子弹 |
-| "先清小怪" / "游击打法" | 游击（skirmish） | 优先清除最弱目标，主动闪避弹道 |
-| 其他内容 | 对话（dialogue） | 流式对话，携带情绪标签 |
+狱印分三类，可重复叠层（有上限）：
 
-NPC 初始姿态为**守护**。
+- **魂体印**：强化玩家（移速、伤害、闪避、生命等）
+- **鬼差印**：强化乌枭（守护减伤、回血、集火等）
+- **契约印**：强化配合效果
 
----
+### 战斗要点
 
-## 突击姿态 RL 控制
+- 场景中有柱子、断墙等掩体，可利用障碍物阻挡视线和弹幕。
+- 敌人类型包括小怪、精英、Boss；部分 Boss 会释放范围技能（如地面圈、荆棘墙等）。
+- 玩家与乌枭都有独立血量；乌枭倒下后会暂时失联，本层仍由玩家继续推进。
 
-### 判断是否正在使用 RL 模型
+### 乌枭战斗姿态
 
-切换到突击姿态后，**游戏界面顶部 HUD** 会实时显示当前控制模式：
+通过聊天下达战术指令，无需额外按钮。当前实现两种姿态：
 
-| HUD 显示 | 含义 |
-|---|---|
-| `姿态 突击 [RL 加载中…]` | 模型首次加载中（约 1-2 秒） |
-| `姿态 突击 [RL]` | RL 模型已就绪，正在控制移动 |
-| `姿态 突击 [RL 失败·规则]` | 模型加载失败，已降级为规则 AI |
-| `姿态 突击 [规则]` | 模型尚未触发加载 |
+| 姿态 | 行为概要 |
+|------|----------|
+| **守护（guard）** | 默认姿态。乌枭用寻路回到你身边并跟随，攻击射程内敌人；贴近时为你减伤。玩家危急时他会主动救援（回血 + 护盾）。 |
+| **突击（assault）** | 乌枭前压到敌人附近交战，自动绕障接近；进入战斗距离后由策略模型控制走位与输出（浏览器内加载 `assault_policy.onnx`，未加载成功时降级为规则 AI）。 |
 
-浏览器控制台（F12）也会打印：
-```
-[RL] assault_policy.onnx loaded, RL mode active.
-```
+指令示例：
 
-### 模型文件
+- 「回来守护我」「贴着我」→ 守护
+- 「上去打」「突击」→ 突击
+- 其他内容 → 正常对话
 
-`game/assault_policy.onnx` — 101 维观测输入，9 个离散动作输出（8方向移动 + 静止）。
-
-模型由 `rl/` 模块独立训练产出，游戏运行时**无需 Python，浏览器内直接推理**，延迟 < 1ms/帧。
+HUD 会显示当前姿态；突击时还会标注当前是策略模型还是规则 AI 在控制。
 
 ---
 
-## RL 训练（可选）
+## 智能 NPC 设计
 
-`rl/` 模块与游戏服务端完全独立，只需要 Python 环境和 RL 依赖。
+乌枭不只是一个聊天机器人。后端把**玩家主动对话**和**战斗中的自主行为**分成两条链路，共用记忆与角色设定，但决策节奏不同。
 
-### 训练
-
-```bash
-# 标准训练（2M 步，8 并行环境，约 1-2 小时 CPU）
-python -m rl.train
-
-# 指定步数
-python -m rl.train --timesteps 5000000
-
-# 快速验证环境是否正常（5 万步，几分钟，单进程）
-python -m rl.train --timesteps 50000 --run-name debug --no-subproc
-
-# 在上次基础上继续训练（resume）
-python -m rl.train --resume rl/checkpoints/assault_best/best_model.zip --timesteps 5000000
-```
-
-训练输出：
-- `rl/checkpoints/assault_best/best_model.zip` — 评估期间的最优模型（推荐导出此文件）
-- `rl/checkpoints/assault_v1_final.zip` — 训练结束时的最终模型
-- `rl/checkpoints/assault_*_steps.zip` — 每 20 万步的定期检查点
-
-### 导出 ONNX
-
-```bash
-# 导出 best_model（推荐）并验证推理结果一致性
-python -m rl.export_onnx --verify
-
-# 导出指定检查点
-python -m rl.export_onnx --model rl/checkpoints/assault_v1_final.zip --verify
-```
-
-输出 `rl/assault_policy.onnx`。
-
-### 部署到游戏
-
-```bash
-cp rl/assault_policy.onnx game/
-```
-
-重新加载游戏页面即可生效。
-
-### 完整流程（首次或增加训练步数）
-
-```bash
-# 1. 训练
-python -m rl.train --timesteps 5000000
-
-# 2. 导出
-python -m rl.export_onnx --verify
-
-# 3. 部署
-cp rl/assault_policy.onnx game/
-
-# 4. 刷新浏览器游戏页面，切换到突击姿态查看效果
-```
-
----
-
-## API 接口
-
-### `POST /api/chat/stream`
-
-统一对话 + 指令接口。服务端并行执行意图分类和记忆检索，结果以 NDJSON 流返回。
-
-请求体：
-
-```json
-{
-  "player_id": "p1",
-  "npc_id": "wuxiao_01",
-  "npc_name": "乌枭",
-  "message": "这里有多少敌人？",
-  "scene_info": {
-    "mode": "battle",
-    "floor": 1,
-    "ally_stance": "guard",
-    "player_hp": 120,
-    "ally_hp": 150,
-    "enemy_count": 3,
-    "boss_alive": true
-  }
-}
-```
-
-响应事件类型：
-
-| 事件 | 触发时机 | 关键字段 |
-|---|---|---|
-| `meta` | 立即 | `npc_id` |
-| `command` | 识别为战术指令时 | `stance`、`reply` |
-| `delta` | 对话 token 批次 | `text`（每批约 8 字符） |
-| `done` | 对话流结束 | `action.dialogue`、`action.emotion` |
-| `error` | 出错 | `message`、`fallback` |
-
-对话响应示例：
+### 整体架构
 
 ```text
-{"type":"meta","npc_id":"wuxiao_01"}
-{"type":"delta","text":"三个，"}
-{"type":"delta","text":"别废话，跟上！"}
-{"type":"done","action":{"action_type":"dialogue","dialogue":"三个，别废话，跟上！","emotion":"focused"}}
+浏览器（game/）
+  ├─ 战斗循环：上报 scene_info（血量、敌数、姿态、弹幕威胁等）
+  ├─ POST /api/chat/stream   ← 玩家发消息
+  └─ POST /api/npc/think     ← 定时/事件触发，乌枭自主思考
+
+NPC API（server/）
+  ├─ 意图分类：对话 vs 战术指令（guard / assault）
+  ├─ 记忆检索：世界观、人设、历史对话
+  ├─ 流式生成：对话 token + 情绪标签
+  └─ 自主决策：noop / 切姿态 / 主动说一句话
 ```
 
-指令响应示例：
+### 玩家对话（`/api/chat/stream`）
 
-```text
-{"type":"meta","npc_id":"wuxiao_01"}
-{"type":"command","stance":"assault","reply":"好嘞，我去前面撕，你别拖后腿。"}
-```
+玩家输入后，服务端**并行**执行意图分类和记忆检索：
 
-### `GET /health`
+- 识别为**战术指令** → 直接返回 `command` 事件，前端切换乌枭姿态并显示确认语
+- 识别为**对话** → 拼装 Prompt 后流式输出回复，末尾附带情绪标签（如 `focused`、`worried`）
 
-```json
-{ "status": "ok" }
-```
+对话会写入短期记忆；结束后异步分级（日常 / 重要）并写入 ChromaDB 长期记忆，供后续检索。
+
+### 自主思考（`/api/npc/think`）
+
+战斗中前端持续上报局面，后端按优先级触发乌枭「想一想」：
+
+| 优先级 | 典型场景 | 处理方式 |
+|--------|----------|----------|
+| P0 危急 | 乌枭/玩家濒死、玩家发呆挨打 | 规则优先：求援、切守护等硬响应 |
+| P1 场景 | 换层、Boss 出现、敌群突变 | 规则给**提示**，由 LLM 生成自然台词 |
+| P2 战术 | 弹幕、缄言、地面圈、视线被挡 | 战术提示 + LLM 决策 |
+| P3 日常 | 长时间无对话、局面平稳 | LLM 决定是否碎嘴；无话可说则保持沉默 |
+
+决策结果三类：
+
+- `noop`：不说话、不动
+- `command`：切换 guard / assault
+- `dialogue`：主动说一句话（气泡 + 可选记录）
+
+为避免话痨，系统带有发言冷却、去重、战术意图有效期（如 30s 内不反复反转姿态）等约束。守护贴身时还会过滤「跟紧我」等与姿态矛盾的台词。
+
+### 记忆系统
+
+| 类型 | 存储 | 用途 |
+|------|------|------|
+| 短期记忆 | 进程内 deque | 最近若干轮对话，重启服务后清空 |
+| 世界观 | ChromaDB | `lore/world_setting.md` 导入 |
+| 角色设定 | ChromaDB | `lore/persona_setting.md` 导入 |
+| 对话记忆 | ChromaDB | 运行时追加，分 daily 摘要 / important 原文 |
+
+检索时一次 embedding，并行查询多类记忆，拼进 Prompt 上下文。
+
+### 情绪与表达
+
+对话回复末尾由模型输出 `<emotion>...</emotion>`，前端映射为颜文字气泡。自主发言的战术确认句也会走气泡展示，保持战斗中的存在感。
+
+### 角色：乌枭（`wuxiao_01`）
+
+设定见 `lore/persona_setting.md`：嘴臭、话痨、重规矩的鬼差，熟悉阴司狱房结构。他会根据当前楼层、敌情、你的血量、自己的姿态和最近说过的话来调整语气，而不是每句都念固定模板。
 
 ---
 
-## 对话链路
+## 项目结构（简）
 
 ```text
-game.js 表单提交
-  │
-  └─ POST /api/chat/stream
-       │
-       ├─ 并行启动：① 意图分类 LLM  ② 短期记忆  ③ 长期记忆检索
-       │
-       ├─ 意图 = command
-       │    └─ yield command 事件 → 前端切换姿态，结束
-       │
-       └─ 意图 = dialogue
-            ├─ 等待记忆检索完成（通常已并行完成）
-            ├─ build_messages()
-            ├─ chat_completion_stream() → 逐批 yield delta
-            ├─ yield done（含 emotion）
-            └─ 后台线程异步写短期 + 长期记忆（不阻塞流）
+├─ run.py / run_game.py      # 启动入口
+├─ config.example.yaml       # 配置模板
+├─ game/                     # 游戏客户端（静态页面 + JS）
+├─ server/                   # NPC API（Flask）
+├─ lore/                     # 世界观与角色文本
+├─ scripts/                  # ChromaDB 导入脚本
+└─ data/ / models/           # 运行时数据（gitignore，需本地生成或下载）
 ```
 
-长期记忆一次 embedding，并行查询四类 ChromaDB 记录：
-
-- `world_chunks`：世界观设定
-- `persona_chunks`：角色设定
-- `dialogue_daily_chunks`：日常对话摘要
-- `dialogue_important_chunks`：重要对话原文
+更细的模块说明见 `Agents.md`。
 
 ---
 
-## 验证
+## 常见问题
+
+**Q: 聊天没反应？**  
+确认 `python run.py` 在跑、`config.yaml` 中 API Key 正确，且浏览器能访问 `http://127.0.0.1:5100/health`。
+
+**Q: 启动报嵌入模型找不到？**  
+将 `BAAI/bge-small-zh-v1.5` 放到 `models/`，或把 `config.yaml` 里 `embeddings.local_files_only` 改为 `false`。
+
+**Q: 乌枭从不主动说话？**  
+自主发言受冷却和局面变化约束；危急或换层时更容易触发。可在 `config.yaml` 的 `npc_autonomy` 段调整间隔（修改后需重启 `run.py`）。
+
+**Q: 改 API 地址？**  
+后端端口在 `run.py`；前端请求地址在 `game/game.js` 顶部 `NPC_API` 常量，默认 `http://127.0.0.1:5100`。
+
+---
+
+## 验证 API
 
 ```bash
-# 健康检查
 curl http://127.0.0.1:5100/health
 
-# 流式对话
 curl -X POST http://127.0.0.1:5100/api/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"player_id":"p1","npc_id":"wuxiao_01","npc_name":"乌枭","message":"这里有多少敌人？","scene_info":{"mode":"battle","floor":1}}'
+  -d '{"player_id":"p1","npc_id":"wuxiao_01","npc_name":"乌枭","message":"这里有多少敌人？","scene_info":{"mode":"battle","floor":1,"ally_stance":"guard","enemy_count":3}}'
 ```
