@@ -861,6 +861,10 @@ function loadRoom(index) {
   state.player.y = sp.player.y;
   state.ally.x = sp.ally.x;
   state.ally.y = sp.ally.y;
+  state.player._stuckT = 0;
+  state.player._stuckWarned = false;
+  state.ally._stuckT = 0;
+  state.ally._stuckWarned = false;
 
   if (_rlLoadState === "ready") _rlResetLstmState();
   state.ally.combatPhase = "approach";
@@ -996,6 +1000,51 @@ function bulletHitsObstacle(bx, by) {
   return allObstacles().some(
     (o) => bx >= o.x && bx <= o.x + o.w && by >= o.y && by <= o.y + o.h
   );
+}
+
+const STUCK_ESCAPE_SEC = 2;
+
+function tickEntityStuckEscape(entity, dt, opts = {}) {
+  if (!entity || entity.hp <= 0 || state.result || state.floorState !== "playing") {
+    if (entity) {
+      entity._stuckT = 0;
+      entity._stuckWarned = false;
+    }
+    return;
+  }
+  const px = entity._stuckPrevX ?? entity.x;
+  const py = entity._stuckPrevY ?? entity.y;
+  const moved = Math.hypot(entity.x - px, entity.y - py);
+  entity._stuckPrevX = entity.x;
+  entity._stuckPrevY = entity.y;
+
+  const embedded = collidesWithObstacle(entity.x, entity.y, entity.radius);
+  const wedged = opts.moving && moved < Math.max(0.6, (opts.speed || 0) * dt * 0.12);
+
+  if (embedded || wedged) {
+    entity._stuckT = (entity._stuckT || 0) + dt;
+    if (entity._stuckT >= 1 && !entity._stuckWarned) {
+      entity._stuckWarned = true;
+      window.GameFx.floatText(entity.x, entity.y - 30, opts.warn || "卡住了…", "#ffe08a");
+    }
+  } else {
+    entity._stuckT = 0;
+    entity._stuckWarned = false;
+  }
+
+  if (entity._stuckT < STUCK_ESCAPE_SEC) return;
+
+  const pos = findClearSpawnPos(entity.x, entity.y, entity.radius, {});
+  entity.x = pos.x;
+  entity.y = pos.y;
+  entity._stuckT = 0;
+  entity._stuckWarned = false;
+  entity._stuckPrevX = entity.x;
+  entity._stuckPrevY = entity.y;
+  if (entity.navPath) entity.navPath = null;
+  window.GameFx.floatText(entity.x, entity.y - 42, opts.free || "脱困", "#9fe4ff");
+  window.GameFx.burst(entity.x, entity.y, "#9fe4ff", 6);
+  if (opts.bubble) setAllyBubble(opts.bubble);
 }
 
 // 带障碍物分量滑动的移动辅助
@@ -1308,8 +1357,15 @@ function updatePlayer(dt) {
   if (state.keys.ArrowRight || state.keys.KeyD) dx += 1;
 
   const [nx, ny] = normalize(dx, dy);
-  if (nx !== 0 || ny !== 0) npcMarkPlayerAction();
+  const moving = nx !== 0 || ny !== 0;
+  if (moving) npcMarkPlayerAction();
   moveWithCollision(state.player, nx * state.player.speed * dt, ny * state.player.speed * dt);
+  tickEntityStuckEscape(state.player, dt, {
+    moving,
+    speed: state.player.speed,
+    warn: "墙体卡住…",
+    free: "魂体脱困",
+  });
   state.player.attackCd = Math.max(0, state.player.attackCd - dt);
   state.player.shieldCd = Math.max(0, state.player.shieldCd - dt);
   state.player.dashCd = Math.max(0, state.player.dashCd - dt);
@@ -1375,10 +1431,12 @@ function updateAlly(dt) {
   state.ally.attackCd = Math.max(0, state.ally.attackCd - dt);
   state.ally.rescueCd = Math.max(0, state.ally.rescueCd - dt);
   const speed = state.ally.speed * cfg.speedMul;
+  let allyMoving = false;
 
   if (state.ally.stance === "guard" || state.player.hp <= 40) {
     const d = distance(state.ally, state.player);
     if (d > 50) {
+      allyMoving = true;
       const [nx, ny] = normalize(state.player.x - state.ally.x, state.player.y - state.ally.y);
       moveWithCollision(state.ally, nx * speed * dt, ny * speed * dt);
     }
@@ -1397,6 +1455,7 @@ function updateAlly(dt) {
 
     const target = allyAssaultTarget();
     if (target) {
+      allyMoving = true;
       const d   = distance(state.ally, target);
       const los = _rlHasLOS(state.ally.x, state.ally.y, target.x, target.y);
       const inEnvelope = d <= cfg.attackRange * _COMBAT_EXIT_DIST_MUL;
@@ -1469,6 +1528,16 @@ function updateAlly(dt) {
     state.player.shieldCd = 2.2 * (state.blessingShieldMul || 1);
     state.ally.rescueCd = 9.0;
     setAllyBubble("先后撤，我给你护盾。");
+  }
+
+  if (!allyIsDown()) {
+    tickEntityStuckEscape(state.ally, dt, {
+      moving: allyMoving,
+      speed,
+      warn: "乌枭卡住…",
+      free: "乌枭脱困",
+      bubble: "墙缝太窄，我挣脱出来了。",
+    });
   }
 }
 
