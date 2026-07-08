@@ -5,7 +5,6 @@
 游戏前端（`game/`）与 NPC 后端（`server/`）完全分离：浏览器负责战斗与渲染，Python 服务负责 LLM 对话、战术指令解析和自主决策。
 
 ![模拟游戏界面-1](images/img1.png)
-![模拟游戏界面-2](images/img2.png)
 
 ---
 
@@ -224,29 +223,3 @@ NPC API（server/）
 更细的模块说明见 `Agents.md`。
 
 ---
-
-## 常见问题
-
-**Q: 聊天没反应？**  
-确认 `python run.py` 在跑、`config.yaml` 中 API Key 正确，且浏览器能访问 `http://127.0.0.1:5100/health`。
-
-**Q: 启动报嵌入模型找不到？**  
-将 `BAAI/bge-small-zh-v1.5` 放到 `models/`，或把 `config.yaml` 里 `embeddings.local_files_only` 改为 `false`。
-
-**Q: 乌枭从不主动说话？**  
-自主发言受冷却和局面变化约束；危急或换层时更容易触发。可在 `config.yaml` 的 `npc_autonomy` 段调整间隔（修改后需重启 `run.py`）。
-
-**Q: 改 API 地址？**  
-后端端口在 `run.py`；前端请求地址在 `game/game.js` 顶部 `NPC_API` 常量，默认 `http://127.0.0.1:5100`。
-
----
-
-## 验证 API
-
-```bash
-curl http://127.0.0.1:5100/health
-
-curl -X POST http://127.0.0.1:5100/api/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"p1","npc_id":"wuxiao_01","npc_name":"乌枭","message":"这里有多少敌人？","scene_info":{"mode":"battle","floor":1,"ally_stance":"guard","enemy_count":3}}'
-```
