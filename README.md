@@ -219,7 +219,3 @@ NPC API（server/）
 ├─ scripts/                  # ChromaDB 导入脚本
 └─ data/ / models/           # 运行时数据（gitignore，需本地生成或下载）
 ```
-
-更细的模块说明见 `Agents.md`。
-
----
