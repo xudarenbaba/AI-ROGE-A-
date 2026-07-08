@@ -66,8 +66,9 @@ DT: float       = 1.0 / 60.0
 MAX_STEPS: int  = 60 * 20     # 战斗回合短：20s 足够（导航不再占用步数）
 FLOOR_RANGE     = (1, 6)
 
+# 碰撞盒与 game/obstacles/layouts.js 四组布局对齐（kind 仅渲染用，训练忽略）
 OBSTACLE_LAYOUTS: list[list[dict]] = [
-    # 布局 0：中央横墙 + 两侧竖柱 + 斜角掩体
+    # 布局 0 hall_pillars：中央横墙 + 两侧竖柱 + 斜角掩体
     [
         {"x": 360, "y": 255, "w": 180, "h": 22},
         {"x": 240, "y": 170, "w": 22,  "h": 130},
@@ -195,8 +196,10 @@ class Entity:
 
 @dataclass
 class Enemy(Entity):
-    kind: str      = "mob"
+    kind: str       = "mob"
     shoot_cd: float = 0.0
+    warn_t: float   = 0.0
+    pending_fan: dict | None = None
 
 
 @dataclass
@@ -252,11 +255,38 @@ def _move_with_collision(entity: Entity, dx: float, dy: float,
 
 def _create_bullet(owner_x: float, owner_y: float,
                    target_x: float, target_y: float,
-                   speed: float, damage: float) -> Bullet:
+                   speed: float, damage: float,
+                   radius: float = BULLET_RADIUS) -> Bullet:
     nx, ny = _normalize(target_x - owner_x, target_y - owner_y)
     return Bullet(x=owner_x, y=owner_y,
                   vx=nx * speed, vy=ny * speed,
-                  radius=BULLET_RADIUS, damage=damage, ttl=BULLET_TTL)
+                  radius=radius, damage=damage, ttl=BULLET_TTL)
+
+
+def _aimed_shot(bullets: list[Bullet], enemy: Enemy,
+                target_x: float, target_y: float,
+                speed: float, damage: float) -> None:
+    bullets.append(
+        _create_bullet(enemy.x, enemy.y, target_x, target_y, speed, damage)
+    )
+
+
+def _fan_shot(bullets: list[Bullet], enemy: Enemy,
+              target_x: float, target_y: float,
+              speed: float, damage: float,
+              spread_deg: float, count: int) -> None:
+    """与 game/bullets/patterns.js fanShot 对齐。"""
+    base = math.atan2(target_y - enemy.y, target_x - enemy.x)
+    half = (spread_deg / 2) * math.pi / 180
+    step = spread_deg / (count - 1) if count > 1 else 0.0
+    for i in range(count):
+        ang = base - half + (step * i) * math.pi / 180
+        nx, ny = math.cos(ang), math.sin(ang)
+        bullets.append(Bullet(
+            x=enemy.x, y=enemy.y,
+            vx=nx * speed, vy=ny * speed,
+            radius=3.0, damage=damage, ttl=BULLET_TTL,
+        ))
 
 
 def _has_line_of_sight(ax: float, ay: float,
@@ -443,21 +473,34 @@ class AssaultEnv(gym.Env):
             self._attack_cd = ASSAULT_INTERVAL
             fired_this_step = True
 
-        # 3. 敌人移动 + 开火
+        # 3. 敌人移动 + 开火（含 Boss 预警扇形弹，与 game.js updateEnemies 对齐）
+        ally = self._ally
         for enemy in self._enemies:
             enemy.shoot_cd = max(0.0, enemy.shoot_cd - DT)
-            nx, ny = _normalize(self._ally.x - enemy.x, self._ally.y - enemy.y)
+            if enemy.warn_t > 0.0:
+                enemy.warn_t = max(0.0, enemy.warn_t - DT)
+                continue
+            nx, ny = _normalize(ally.x - enemy.x, ally.y - enemy.y)
             _move_with_collision(enemy, nx * enemy.speed * DT, ny * enemy.speed * DT,
                                  self._obstacles)
+            spd = BOSS_BULLET_SPEED  if enemy.kind == "boss" else MOB_BULLET_SPEED
+            dmg = BOSS_BULLET_DAMAGE if enemy.kind == "boss" else MOB_BULLET_DAMAGE
             if enemy.shoot_cd <= 0.0:
-                spd = BOSS_BULLET_SPEED  if enemy.kind == "boss" else MOB_BULLET_SPEED
-                dmg = BOSS_BULLET_DAMAGE if enemy.kind == "boss" else MOB_BULLET_DAMAGE
-                cd  = BOSS_SHOOT_CD_RESET if enemy.kind == "boss" else MOB_SHOOT_CD_RESET
-                self._enemy_bullets.append(
-                    _create_bullet(enemy.x, enemy.y,
-                                   self._ally.x, self._ally.y, spd, dmg)
-                )
-                enemy.shoot_cd = cd
+                if enemy.kind == "boss" and random.random() < 0.38:
+                    enemy.warn_t = 0.45
+                    enemy.pending_fan = {"spd": spd, "dmg": dmg}
+                    enemy.shoot_cd = 0.5
+                else:
+                    _aimed_shot(self._enemy_bullets, enemy, ally.x, ally.y, spd, dmg)
+                    enemy.shoot_cd = (
+                        BOSS_SHOOT_CD_RESET if enemy.kind == "boss" else MOB_SHOOT_CD_RESET
+                    )
+            elif enemy.pending_fan is not None:
+                pf = enemy.pending_fan
+                _fan_shot(self._enemy_bullets, enemy, ally.x, ally.y,
+                          pf["spd"], pf["dmg"], 42.0, 5)
+                enemy.pending_fan = None
+                enemy.shoot_cd = 1.35
 
         # 4. 子弹物理
         damage_dealt = self._update_bullets()

@@ -14,6 +14,10 @@ train.py — 训练 assault 姿态策略网络。
     # 在 8000 万步基础上再训 500 万（总目标 8500 万）
     python -m rl.train --resume rl/checkpoints/assault_79999360_steps.zip --timesteps 85000000
 
+    # game 改动后微调（总目标 = 已有步数 + 新增；例：79999360 + 100000）
+    python -m rl.train --resume rl/checkpoints/assault_79999360_steps.zip \
+        --timesteps 80100000 --run-name assault_combat_v3_finetune
+
 参数说明见 argparse 部分。
 输出：
     rl/checkpoints/assault_<steps>_steps.zip  — 定期检查点

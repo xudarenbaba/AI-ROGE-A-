@@ -1,6 +1,5 @@
 /**
- * 障碍布局（仅 game 端；训练期不同步 rl/env.py）。
- * 碰撞盒仍为矩形 x,y,w,h — 不改变 RL 观测逻辑。
+ * 障碍布局。碰撞盒 x,y,w,h 与 rl/env.py OBSTACLE_LAYOUTS 对齐；kind 仅渲染用。
  */
 (function () {
   const LAYOUTS = [
