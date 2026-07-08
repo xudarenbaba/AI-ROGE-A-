@@ -64,6 +64,8 @@
       wall: { fill: `${meta.haze}ee`, stroke: `${meta.accent}cc`, cap: `${meta.accent}33` },
       pillar: { fill: `${meta.tone}dd`, stroke: `${meta.accent}ff`, cap: `${meta.accent}44` },
       rubble: { fill: `${meta.haze}aa`, stroke: `${meta.accent}77`, cap: `${meta.accent}22` },
+      seal: { fill: `${meta.tone}cc`, stroke: `${meta.accent}55`, cap: `${meta.accent}22` },
+      altar: { fill: `${meta.haze}bb`, stroke: `${meta.accent}88`, cap: `${meta.accent}33` },
     };
     obstacles.forEach((o) => {
       const st = kindStyle[o.kind] || kindStyle.wall;

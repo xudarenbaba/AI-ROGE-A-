@@ -11,16 +11,24 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: 1fr 340px;
-  gap: 16px;
+  /* 三列紧挨：游戏区按内容宽度，不拉伸占满中间空白 */
+  grid-template-columns: auto 204px 400px;
+  grid-template-areas: "game stats chat";
+  gap: 12px;
   padding: 16px;
   min-height: 100vh;
+  align-items: start;
+  width: fit-content;
+  max-width: calc(100vw - 32px);
+  margin: 0 auto;
 }
 
 .game-panel {
+  grid-area: game;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .lore-banner {
@@ -79,6 +87,16 @@ body {
   display: none;
 }
 
+.blessing-overlay.picked {
+  pointer-events: none;
+}
+
+.blessing-card:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 .blessing-overlay h3 {
   margin: 0;
   color: #ffd9bf;
@@ -100,8 +118,8 @@ body {
 }
 
 .blessing-card {
-  width: 150px;
-  min-height: 88px;
+  width: 168px;
+  min-height: 108px;
   border: 1px solid #8a4a36;
   border-radius: 10px;
   background: linear-gradient(160deg, #3a2218, #22141c);
@@ -111,12 +129,35 @@ body {
   text-align: left;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+  border-left-width: 4px;
 }
+
+.blessing-card--soul { border-left-color: #6ec4ff; }
+.blessing-card--ally { border-left-color: #7ee88a; }
+.blessing-card--pact { border-left-color: #e8c060; }
 
 .blessing-card:hover {
   border-color: #d08050;
   box-shadow: 0 0 12px rgba(255, 140, 90, 0.25);
+}
+
+.blessing-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  align-self: flex-start;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.blessing-badge--soul { background: rgba(80, 140, 220, 0.35); color: #b8e0ff; }
+.blessing-badge--ally { background: rgba(60, 140, 80, 0.35); color: #b8f7b6; }
+.blessing-badge--pact { background: rgba(180, 140, 50, 0.35); color: #ffe9a8; }
+
+.blessing-kind {
+  font-size: 10px;
+  color: #a89078;
 }
 
 .blessing-card strong {
@@ -124,7 +165,7 @@ body {
   color: #ffd4a8;
 }
 
-.blessing-card span {
+.blessing-card .blessing-desc {
   font-size: 12px;
   color: #d8bca6;
   line-height: 1.35;
@@ -163,29 +204,118 @@ body {
   font-size: 12px;
 }
 
-.chat-panel {
-  border: 1px solid #5e2d2b;
-  border-radius: 8px;
-  background: rgba(22, 12, 17, 0.9);
-  padding: 12px;
+.stats-column {
+  grid-area: stats;
   display: flex;
   flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 8px;
+  border: 1px solid #4a3a32;
+  border-radius: 8px;
+  background: rgba(18, 14, 20, 0.92);
   min-height: 540px;
 }
 
-.chat-panel h2 {
-  margin: 0 0 10px;
-  font-size: 18px;
+.chat-column {
+  grid-area: chat;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  width: 400px;
+  height: 540px;
+  max-height: calc(100vh - 32px);
+  overflow: hidden;
+  padding: 12px;
+  border: 1px solid #5e2d2b;
+  border-radius: 8px;
+  background: rgba(22, 12, 17, 0.9);
+}
+
+.chat-column h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
   color: #ffd6b5;
+  flex-shrink: 0;
+}
+
+.stat-panel {
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.stat-panel--soul {
+  border: 1px solid #3a5070;
+  background: linear-gradient(160deg, rgba(24, 32, 48, 0.96), rgba(14, 18, 28, 0.98));
+  color: #c8daf0;
+}
+
+.stat-panel--ally {
+  border: 1px solid #3d5a3a;
+  background: linear-gradient(160deg, rgba(28, 36, 28, 0.95), rgba(18, 22, 20, 0.98));
+  color: #c8e0c4;
+}
+
+.stat-panel--pact {
+  border: 1px solid #5a4a28;
+  background: linear-gradient(160deg, rgba(40, 34, 20, 0.95), rgba(22, 18, 12, 0.98));
+  color: #e8d8b0;
+}
+
+.stat-panel.hidden {
+  display: none;
+}
+
+.stat-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 5px;
+  letter-spacing: 0.3px;
+}
+
+.stat-panel--soul .stat-panel-title { color: #9fe4ff; }
+.stat-panel--ally .stat-panel-title { color: #b8f7b6; }
+.stat-panel--pact .stat-panel-title { color: #ffe9a8; }
+
+.stat-panel dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 2px 6px;
+}
+
+.stat-panel dt {
+  margin: 0;
+  opacity: 0.72;
+}
+
+.stat-panel dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+.stat-panel .stat-highlight {
+  color: #ffe08a;
+}
+
+.stat-panel .stat-blessing-list {
+  font-size: 10px;
+  opacity: 0.9;
 }
 
 .chat-log {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   border: 1px solid #4d272a;
   border-radius: 8px;
   padding: 8px;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
   background: #100c14;
+  scrollbar-gutter: stable;
 }
 
 .msg {
@@ -208,6 +338,7 @@ body {
 
 #chatForm {
   margin-top: 10px;
+  flex-shrink: 0;
   display: flex;
   gap: 8px;
 }
@@ -228,4 +359,48 @@ body {
   border-radius: 6px;
   padding: 8px 12px;
   cursor: pointer;
+}
+
+@media (max-width: 1500px) {
+  .layout {
+    margin: 0;
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 1180px) {
+  .layout {
+    grid-template-columns: auto 190px minmax(300px, 360px);
+  }
+
+  .chat-column {
+    width: 100%;
+  }
+}
+
+@media (max-width: 960px) {
+  .layout {
+    width: 100%;
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "game"
+      "stats"
+      "chat";
+  }
+
+  .stats-column {
+    flex-direction: row;
+    flex-wrap: wrap;
+    min-height: unset;
+  }
+
+  .stats-column .stat-panel {
+    flex: 1 1 180px;
+  }
+
+  .chat-column {
+    width: 100%;
+    height: 360px;
+    max-height: 50vh;
+  }
 }

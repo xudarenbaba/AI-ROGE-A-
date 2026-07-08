@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Roguelite 网页演示</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=chat_scroll" />
   </head>
   <body>
     <div class="layout">
@@ -12,7 +12,7 @@
         <div class="lore-banner">
           <h1>《无间行录》：十八狱镇压行动</h1>
           <p>
-            你是“阳差未绝”的魂体，坠入失序阴司。每通关一层地狱，就能修复一枚狱印、逼近篡狱真相。
+            你是“阳差未绝”的魂体，坠入失序阴司。每层有多间狱房——清怪开门、往前探索，尽头镇压 Boss 后择狱印。
             你身边的鬼差“乌枭”嘴臭但懂规矩，别被他骂走神了。
           </p>
         </div>
@@ -20,20 +20,26 @@
           <canvas id="gameCanvas" width="960" height="540"></canvas>
           <div id="blessingOverlay" class="blessing-overlay hidden">
             <h3>选择狱印</h3>
-            <p class="blessing-hint">每层清除后选一枚强化，然后进入下一层</p>
+            <p class="blessing-hint">魂体印强化你 · 鬼差印强化乌枭 · 契约印强化配合 · 可重复叠层</p>
             <div id="blessingChoices" class="blessing-choices"></div>
           </div>
         </div>
         <div class="hud">
           <div id="hudStats"></div>
           <p class="tips">
-            移动：WASD/方向键 | 射击：空格 | 闪避：Shift | 对话控制乌枭（守护 / 突击）
+            移动：WASD/方向键 | 射击：空格 | 闪避：Shift | 清房后靠右侧门前进 | 对话控制乌枭
           </p>
         </div>
       </section>
 
-      <aside class="chat-panel">
-        <h2>鬼差同盟：乌枭（黑签）</h2>
+      <aside class="stats-column" aria-label="角色属性">
+        <div id="playerStatsPanel" class="stat-panel stat-panel--soul"></div>
+        <div id="allyStatsPanel" class="stat-panel stat-panel--ally"></div>
+        <div id="pactStatsPanel" class="stat-panel stat-panel--pact hidden"></div>
+      </aside>
+
+      <aside class="chat-column">
+        <h2>鬼差同盟 · 乌枭</h2>
         <div id="chatLog" class="chat-log"></div>
         <form id="chatForm">
           <input id="chatInput" autocomplete="off" maxlength="160" placeholder="输入战术指令（例如：守护我 / 去突击）..." />
@@ -42,14 +48,22 @@
       </aside>
     </div>
 
-    <!-- onnxruntime-web：assault 姿态 RL 推理。如网络不通可替换为本地文件 -->
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
-    <!-- 寻路模块：assault APPROACH 阶段的栅格 A*，必须在 game.js 之前加载 -->
     <script src="pathfinding.js"></script>
     <script src="obstacles/layouts.js"></script>
+    <script src="dungeon/roomLayouts.js"></script>
+    <script src="dungeon/generator.js"></script>
+    <script src="dungeon/minimap.js"></script>
+    <script src="dungeon/doorTransition.js"></script>
+    <script src="combat/shooting.js"></script>
+    <script src="combat/hazards.js"></script>
+    <script src="enemies/eliteRegistry.js"></script>
+    <script src="enemies/abilities.js"></script>
+    <script src="bosses/registry.js"></script>
+    <script src="bosses/patterns.js"></script>
     <script src="fx.js"></script>
     <script src="bullets/patterns.js"></script>
     <script src="meta/blessings.js"></script>
-    <script src="game.js?v=upgrade1"></script>
+    <script src="game.js?v=m1_autonomy10"></script>
   </body>
 </html>

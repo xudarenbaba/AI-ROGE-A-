@@ -16,7 +16,65 @@ def _events_block(scene_info: dict[str, Any]) -> str:
     return "、".join(str(e) for e in events)
 
 
-def _tactical_block(scene_info: dict[str, Any]) -> str:
+def _enemy_breakdown_block(scene_info: dict[str, Any]) -> str:
+    bd = scene_info.get("enemy_breakdown")
+    if not bd:
+        return "无"
+    return (
+        f"mob={bd.get('mob', 0)} elite={bd.get('elite', 0)} "
+        f"boss={bd.get('boss', 0)} shade={bd.get('shade', 0)}"
+    )
+
+
+def _blessings_block(scene_info: dict[str, Any]) -> str:
+    summary = scene_info.get("blessings_summary") or {}
+    tags = summary.get("tags") or scene_info.get("build_tags") or []
+    total = scene_info.get("blessings_total", summary.get("total", 0))
+    if not total:
+        return "无"
+    tag_str = "、".join(str(t) for t in tags[:6]) if tags else "无"
+    return f"总数={total}；标签={tag_str}"
+
+
+def scene_summary_block(scene_info: dict[str, Any]) -> str:
+    parts = [
+        f"第{scene_info.get('floor', '?')}层 {scene_info.get('floor_name', '')}",
+        f"房间={scene_info.get('room_label', '')}({scene_info.get('room_type', '')})",
+        f"进度={scene_info.get('dungeon_progress', '')}",
+        f"状态={scene_info.get('floor_state', '')}",
+        f"门={'已开' if scene_info.get('door_open') else '未开'}",
+        f"姿态={scene_info.get('ally_stance', '')}",
+        f"阶段={scene_info.get('ally_combat_phase', '')}",
+        f"玩家HP={scene_info.get('player_hp', '?')}/{scene_info.get('player_max_hp', '?')}",
+        f"乌枭HP={scene_info.get('ally_hp', '?')}/{scene_info.get('ally_max_hp', '?')}",
+        f"敌数={scene_info.get('enemy_count', 0)}",
+        f"Boss={'存活' if scene_info.get('boss_alive') else '无'}",
+    ]
+    if scene_info.get("boss_name"):
+        parts.append(f"Boss名={scene_info.get('boss_name')}")
+    if scene_info.get("elite_present"):
+        parts.append(f"精英={scene_info.get('elite_name', '')}")
+    return "；".join(parts)
+
+
+def player_state_block(scene_info: dict[str, Any]) -> str:
+    keys = (
+        ("player_last_action_s", "距上次操作秒"),
+        ("player_is_active", "玩家活跃"),
+        ("player_is_idle", "玩家发呆"),
+        ("idle_seconds", "玩家聊天空闲秒"),
+        ("since_last_npc_speech", "距上次NPC发言秒"),
+        ("player_silenced", "玩家缄言"),
+        ("player_pulled", "玩家被磁引"),
+        ("screen_fog", "屏幕迷雾"),
+        ("player_in_danger", "玩家危急"),
+        ("ally_in_danger", "乌枭危急"),
+    )
+    parts = [f"{label}={scene_info.get(key)}" for key, label in keys if key in scene_info]
+    return "；".join(parts) if parts else "无"
+
+
+def tactical_block(scene_info: dict[str, Any]) -> str:
     keys = (
         ("nearest_enemy_distance", "最近敌人距离"),
         ("ally_nearest_enemy_distance", "乌枭最近敌人距离"),
@@ -30,16 +88,64 @@ def _tactical_block(scene_info: dict[str, Any]) -> str:
         ("ally_nav_stuck", "乌枭寻路受阻"),
         ("player_under_fire", "玩家刚挨打"),
         ("ally_already_guarding", "已在守护玩家"),
-        ("ally_guard_duration_s", "守护姿态持续秒"),
-        ("player_is_active", "玩家近期活跃"),
+        ("ally_near_player", "乌枭贴身"),
+        ("ally_guard_duration_s", "守护持续秒"),
         ("assault_recommended", "建议切突击"),
+        ("scene_dramatic_change", "局面剧变"),
+        ("hazard_count", "地面圈数"),
+        ("hazard_near_player", "玩家在圈内"),
+        ("hazard_near_ally", "乌枭在圈内"),
+        ("combat_threat_mul", "敌强倍率"),
+        ("can_autonomy_speak", "可自主发言"),
+        ("trigger", "触发类型"),
+        ("trigger_reason", "触发原因"),
     )
-    parts = [
-        f"{label}={scene_info.get(key)}"
-        for key, label in keys
-        if key in scene_info
-    ]
+    parts = [f"{label}={scene_info.get(key)}" for key, label in keys if key in scene_info]
     return "；".join(parts) if parts else "无"
+
+
+def build_scene_context_blocks(
+    scene_info: dict[str, Any],
+    narrative_context: dict[str, str] | None = None,
+    *,
+    include_player_state: bool = True,
+) -> str:
+    narrative = narrative_context or {}
+    blocks = [
+        f"[场景摘要]\n{scene_summary_block(scene_info)}",
+        f"[敌人构成]\n{_enemy_breakdown_block(scene_info)}",
+        f"[狱印摘要]\n{_blessings_block(scene_info)}",
+        f"[最近战斗事件]\n{_events_block(scene_info)}",
+        f"[战术态势]\n{tactical_block(scene_info)}",
+    ]
+    if include_player_state:
+        blocks.append(f"[玩家状态]\n{player_state_block(scene_info)}")
+    blocks.extend([
+        f"[战斗情绪]\n{narrative.get('mood_block', '无')}",
+        f"[当前战术意图]\n{narrative.get('intent_block', '无')}",
+        f"[最近自主发言]\n{narrative.get('recent_autonomous', '无')}",
+    ])
+    return "\n\n".join(blocks)
+
+
+def build_intent_classify_prompt(
+    *,
+    npc_name: str,
+    message: str,
+    scene_info: dict[str, Any],
+) -> str:
+    return (
+        f"npc_name={npc_name}\n"
+        f"[场景摘要]\n{scene_summary_block(scene_info)}\n"
+        f"[战术态势]\n{tactical_block(scene_info)}\n"
+        f"ally_stance={scene_info.get('ally_stance', '')}\n"
+        f"assault_recommended={scene_info.get('assault_recommended', '')}\n"
+        f"player_message={message}"
+    )
+
+
+def _tactical_block(scene_info: dict[str, Any]) -> str:
+    return tactical_block(scene_info)
 
 
 def _coherence_for_trigger(trigger: str, scene_info: dict[str, Any] | None = None) -> str:
@@ -55,7 +161,7 @@ def _coherence_for_trigger(trigger: str, scene_info: dict[str, Any] | None = Non
             "【连贯性与去重约束】\n"
             "1. 不要重复[最近自主发言]中已出现过的措辞。\n"
             "2. guard→assault 在 assault_recommended=true 时不算「轻易反转」。\n"
-            "3. periodic/social 且 since_last_npc_speech≥45s 时可 dialogue 碎嘴；"
+            "3. periodic/social 且 since_last_npc_speech≥38s 时可 dialogue 碎嘴；"
             "但若 assault_recommended=true 应优先 assault。\n"
             "4. 可利用[战术态势]给实用提醒。\n"
             "5. 一句话只表达一个意图。\n"
@@ -105,14 +211,9 @@ def build_messages(
         "从以下词中选一个最符合当前语气的：neutral focused annoyed worried happy tense sarcastic。"
         "不要解释标签，不要省略。"
     )
-    narrative = narrative_context or {}
+    context = build_scene_context_blocks(scene_info, narrative_context)
     user_prompt = (
-        f"[场景]\n{scene_info}\n\n"
-        f"[最近战斗事件]\n{_events_block(scene_info)}\n\n"
-        f"[战术态势]\n{_tactical_block(scene_info)}\n\n"
-        f"[战斗情绪]\n{narrative.get('mood_block', '无')}\n\n"
-        f"[当前战术意图]\n{narrative.get('intent_block', '无')}\n\n"
-        f"[最近自主发言]\n{narrative.get('recent_autonomous', '无')}\n\n"
+        f"{context}\n\n"
         f"[世界观设定]\n{_join_lines(world_chunks)}\n\n"
         f"[角色设定]\n{_join_lines(persona_chunks)}\n\n"
         f"[对话记忆-重要]\n{_join_lines(dialogue_important_chunks)}\n\n"
@@ -148,6 +249,9 @@ _AUTONOMOUS_DECIDE_RULES = (
     "3. dialogue：有战术提醒但暂不切姿态时用。\n"
     "4. ally_hp≤0 时禁止 assault。\n"
     "4b. assault_recommended=true 时不要 noop，应 command→assault。\n"
+    "4d. can_autonomy_speak=false（选印/过门）时只输出 noop。\n"
+    "4e. player_silenced=true 时不要催玩家射击。\n"
+    "4f. hazard_near_player=true 时提醒躲圈，优先 dialogue。\n"
     "4c. guard 贴身时 dialogue 禁止喊「过来」；但 assault 不受此限。\n"
     "5. reply 符合嘴臭话痨风格，简短，1句话，且必须新颖不重复。\n"
     "6. dialogue 回复末尾不要加 emotion 标签。\n"
@@ -179,15 +283,10 @@ def build_autonomous_decide_messages(
         "切换战斗姿态(command)、或主动说一句话(dialogue)。\n"
         "只输出 JSON，不要输出其他文字。"
     )
-    narrative = narrative_context or {}
     intent_hint = "、".join(allowed_intents) if allowed_intents else "noop、command、dialogue"
+    context = build_scene_context_blocks(scene_info, narrative_context)
     user_prompt = (
-        f"[场景]\n{scene_info}\n\n"
-        f"[最近战斗事件]\n{_events_block(scene_info)}\n\n"
-        f"[战术态势]\n{_tactical_block(scene_info)}\n\n"
-        f"[战斗情绪]\n{narrative.get('mood_block', '无')}\n\n"
-        f"[当前战术意图]\n{narrative.get('intent_block', '无')}\n\n"
-        f"[最近自主发言]（禁止重复以下措辞）\n{narrative.get('recent_autonomous', '无')}\n\n"
+        f"{context}\n\n"
         f"[本轮建议intent]\n{intent_hint}\n\n"
         f"[触发类型]\n{trigger}\n\n"
         f"[世界观设定]\n{_join_lines(world_chunks)}\n\n"
@@ -218,7 +317,7 @@ def build_memory_classify_messages(
         "规则：important 保留原文；daily 压缩成 1-2 句摘要。"
     )
     user_prompt = (
-        f"scene_info={scene_info}\n"
+        f"scene_summary={scene_summary_block(scene_info)}\n"
         f"player_message={player_message}\n"
         f"npc_reply={npc_reply}"
     )
@@ -226,4 +325,3 @@ def build_memory_classify_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-

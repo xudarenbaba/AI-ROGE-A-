@@ -32,14 +32,14 @@ CANVAS_W: float = 900.0
 CANVAS_H: float = 540.0
 
 ALLY_RADIUS: float = 13.0
-ALLY_MAX_HP: float = 160.0
+ALLY_MAX_HP: float = 200.0
 ALLY_BASE_SPEED: float = 200.0
 
 ASSAULT_ATTACK_RANGE: float = 110.0
 ASSAULT_KITE_RANGE: float   = 65.0   # 从 55 调整到 65，保证 ally 与敌人的视觉间距
 ASSAULT_INTERVAL: float     = 0.45
 ASSAULT_SPEED_MUL: float    = 1.2
-ASSAULT_DAMAGE: float       = 13.0
+ASSAULT_DAMAGE: float       = 20.0
 ASSAULT_BULLET_SPEED: float = 400.0
 
 MOB_RADIUS: float        = 12.0
@@ -50,6 +50,7 @@ MOB_SHOOT_CD_MAX: float  = 1.8
 MOB_BULLET_SPEED: float  = 170.0
 MOB_BULLET_DAMAGE: float = 5.0
 MOB_SHOOT_CD_RESET: float = 1.6
+MOB_SHOOT_RANGE: float    = 380.0
 
 BOSS_RADIUS: float        = 20.0
 BOSS_BASE_HP: float       = 200.0
@@ -57,6 +58,8 @@ BOSS_BASE_SPEED: float    = 32.0
 BOSS_BULLET_SPEED: float  = 200.0
 BOSS_BULLET_DAMAGE: float = 9.0
 BOSS_SHOOT_CD_RESET: float = 1.2
+BOSS_SHOOT_RANGE: float    = 440.0
+SHOOT_RETRY_CD: float      = 0.25
 
 BULLET_RADIUS: float = 4.0
 BULLET_TTL: float    = 2.2
@@ -105,6 +108,22 @@ OBSTACLE_LAYOUTS: list[list[dict]] = [
         {"x": 620, "y": 155, "w": 130, "h": 20},
         {"x": 240, "y": 365, "w": 130, "h": 20},
         {"x": 620, "y": 365, "w": 130, "h": 20},
+    ],
+    # 布局 4 corridor（game/dungeon/roomLayouts.js）
+    [
+        {"x": 200, "y": 120, "w": 560, "h": 18},
+        {"x": 200, "y": 402, "w": 560, "h": 18},
+        {"x": 380, "y": 230, "w": 18,  "h": 80},
+        {"x": 520, "y": 280, "w": 18,  "h": 70},
+        {"x": 300, "y": 250, "w": 70,  "h": 16},
+    ],
+    # 布局 5 boss 房
+    [
+        {"x": 180, "y": 130, "w": 600, "h": 20},
+        {"x": 180, "y": 390, "w": 600, "h": 20},
+        {"x": 300, "y": 200, "w": 20,  "h": 120},
+        {"x": 640, "y": 200, "w": 20,  "h": 120},
+        {"x": 420, "y": 250, "w": 120, "h": 18},
     ],
 ]
 
@@ -200,6 +219,17 @@ class Enemy(Entity):
     shoot_cd: float = 0.0
     warn_t: float   = 0.0
     pending_fan: dict | None = None
+    ult_cd: float   = 2.5
+
+
+@dataclass
+class Hazard:
+    x: float
+    y: float
+    r: float
+    warn_t: float
+    ttl: float
+    damage: float
 
 
 @dataclass
@@ -361,6 +391,35 @@ def _bullet_time_to_ally(b: Bullet, ally: Entity) -> float:
     return min(1.0, max(0.0, t_hit / BULLET_TTL))
 
 
+def _hazard_threat_tta(h: Hazard, ally: Entity) -> float:
+    """地面 AOE 威胁 TTA，归一化 [0,1]；越小越危险（与 game.js _rlHazardTTA 对齐）。"""
+    dist_c = math.hypot(ally.x - h.x, ally.y - h.y)
+    edge = dist_c - h.r - ally.radius
+    if h.warn_t > 0:
+        return min(1.0, (h.warn_t / 1.2) * 0.45 + max(0.0, edge) / 180.0)
+    if edge <= 0:
+        return 0.0
+    return min(1.0, edge / 120.0)
+
+
+def _collect_threat_entries(
+    ally: Entity,
+    bullets: list[Bullet],
+    hazards: list[Hazard],
+) -> list[tuple[str, Bullet | Hazard, float]]:
+    entries: list[tuple[str, Bullet | Hazard, float]] = []
+    for b in bullets:
+        if math.hypot(b.x - ally.x, b.y - ally.y) > MAX_BULLET_DIST:
+            continue
+        entries.append(("b", b, _bullet_time_to_ally(b, ally)))
+    for h in hazards:
+        if math.hypot(ally.x - h.x, ally.y - h.y) > h.r + MAX_BULLET_DIST:
+            continue
+        entries.append(("h", h, _hazard_threat_tta(h, ally)))
+    entries.sort(key=lambda e: e[2])
+    return entries[:MAX_BULLETS]
+
+
 # ── 环境主体 ──────────────────────────────────────────────────────────────────
 
 class AssaultEnv(gym.Env):
@@ -384,6 +443,7 @@ class AssaultEnv(gym.Env):
         self._enemies: list[Enemy] = []
         self._ally_bullets: list[Bullet] = []
         self._enemy_bullets: list[Bullet] = []
+        self._hazards: list[Hazard] = []
         self._obstacles: list[dict] = []
         self._attack_cd: float = 0.0
         self._step_count: int = 0
@@ -433,6 +493,7 @@ class AssaultEnv(gym.Env):
             speed=BOSS_BASE_SPEED * self._speed_mul,
             kind="boss",
             shoot_cd=0.8,
+            ult_cd=2.5,
         ))
 
         # 射程内开局：ally 生成在随机一个敌人周围 [kite+5, attack×1.3] 且 LOS 通畅处
@@ -440,6 +501,7 @@ class AssaultEnv(gym.Env):
 
         self._ally_bullets  = []
         self._enemy_bullets = []
+        self._hazards       = []
         self._attack_cd     = 0.0
         self._step_count    = 0
         self._prev_action   = 0
@@ -465,13 +527,22 @@ class AssaultEnv(gym.Env):
         target_before = self._nearest_enemy()
         fired_this_step = False
         if target_before is not None and self._attack_cd <= 0.0:
-            self._ally_bullets.append(
-                _create_bullet(self._ally.x, self._ally.y,
-                               target_before.x, target_before.y,
-                               ALLY_BULLET_SPEED, ASSAULT_DAMAGE)
+            dist_fire = self._ally.dist(target_before)
+            los_fire = _has_line_of_sight(
+                self._ally.x, self._ally.y,
+                target_before.x, target_before.y,
+                self._obstacles,
             )
-            self._attack_cd = ASSAULT_INTERVAL
-            fired_this_step = True
+            if dist_fire <= ASSAULT_ATTACK_RANGE and los_fire:
+                self._ally_bullets.append(
+                    _create_bullet(self._ally.x, self._ally.y,
+                                   target_before.x, target_before.y,
+                                   ALLY_BULLET_SPEED, ASSAULT_DAMAGE)
+                )
+                self._attack_cd = ASSAULT_INTERVAL
+                fired_this_step = True
+            else:
+                self._attack_cd = SHOOT_RETRY_CD
 
         # 3. 敌人移动 + 开火（含 Boss 预警扇形弹，与 game.js updateEnemies 对齐）
         ally = self._ally
@@ -485,24 +556,42 @@ class AssaultEnv(gym.Env):
                                  self._obstacles)
             spd = BOSS_BULLET_SPEED  if enemy.kind == "boss" else MOB_BULLET_SPEED
             dmg = BOSS_BULLET_DAMAGE if enemy.kind == "boss" else MOB_BULLET_DAMAGE
+            shoot_range = BOSS_SHOOT_RANGE if enemy.kind == "boss" else MOB_SHOOT_RANGE
+            dist_to_ally = enemy.dist(ally)
+            los_to_ally = _has_line_of_sight(
+                enemy.x, enemy.y, ally.x, ally.y, self._obstacles,
+            )
+            can_fire = dist_to_ally <= shoot_range and los_to_ally
             if enemy.shoot_cd <= 0.0:
-                if enemy.kind == "boss" and random.random() < 0.38:
-                    enemy.warn_t = 0.45
-                    enemy.pending_fan = {"spd": spd, "dmg": dmg}
-                    enemy.shoot_cd = 0.5
+                if can_fire:
+                    if enemy.kind == "boss" and random.random() < 0.38:
+                        enemy.warn_t = 0.45
+                        enemy.pending_fan = {"spd": spd, "dmg": dmg}
+                        enemy.shoot_cd = 0.5
+                    else:
+                        _aimed_shot(self._enemy_bullets, enemy, ally.x, ally.y, spd, dmg)
+                        enemy.shoot_cd = (
+                            BOSS_SHOOT_CD_RESET if enemy.kind == "boss" else MOB_SHOOT_CD_RESET
+                        )
                 else:
-                    _aimed_shot(self._enemy_bullets, enemy, ally.x, ally.y, spd, dmg)
-                    enemy.shoot_cd = (
-                        BOSS_SHOOT_CD_RESET if enemy.kind == "boss" else MOB_SHOOT_CD_RESET
-                    )
+                    enemy.shoot_cd = SHOOT_RETRY_CD
             elif enemy.pending_fan is not None:
                 pf = enemy.pending_fan
-                _fan_shot(self._enemy_bullets, enemy, ally.x, ally.y,
-                          pf["spd"], pf["dmg"], 42.0, 5)
+                if can_fire:
+                    _fan_shot(self._enemy_bullets, enemy, ally.x, ally.y,
+                              pf["spd"], pf["dmg"], 42.0, 5)
+                    enemy.shoot_cd = 1.35
+                else:
+                    enemy.shoot_cd = SHOOT_RETRY_CD
                 enemy.pending_fan = None
-                enemy.shoot_cd = 1.35
+            if enemy.kind == "boss" and enemy.warn_t <= 0.0:
+                enemy.ult_cd = max(0.0, enemy.ult_cd - DT)
+                if enemy.ult_cd <= 0.0:
+                    self._spawn_boss_ground_aoe(enemy)
+                    enemy.ult_cd = 7.0
 
-        # 4. 子弹物理
+        # 4. 地面 AOE + 子弹物理
+        self._update_hazards()
         damage_dealt = self._update_bullets()
 
         # 5. 清除死亡敌人
@@ -521,10 +610,8 @@ class AssaultEnv(gym.Env):
         hp_lost = max(0.0, ally_hp_before - self._ally.hp)
         target_now = self._nearest_enemy()
         dist_now   = self._ally.dist(target_now) if target_now is not None else 0.0
-        min_bullet_tta = (
-            min((_bullet_time_to_ally(b, self._ally) for b in self._enemy_bullets), default=1.0)
-            if self._enemy_bullets else 1.0
-        )
+        threats = _collect_threat_entries(self._ally, self._enemy_bullets, self._hazards)
+        min_bullet_tta = threats[0][2] if threats else 1.0
         reward = self._compute_reward(
             damage_dealt, hp_lost, target_now, action,
             dist_now, fired_without_los, self._still_frames, min_bullet_tta,
@@ -616,31 +703,35 @@ class AssaultEnv(gym.Env):
             idx += 5
         idx += (MAX_ENEMIES - 1 - len(others)) * 5
 
-        # ── 段4：最多 8 颗威胁子弹（6维/颗）─────────────────────────────────
-        # dx, dy, 速度方向vx, 速度方向vy, 距离归一化, 预测碰撞时间归一化
-        # 排序：优先按预测碰撞时间（越短越危险）
-        threat_bullets = [
-            b for b in self._enemy_bullets
-            if math.hypot(b.x - ally.x, b.y - ally.y) < MAX_BULLET_DIST
-        ]
-        threat_bullets.sort(
-            key=lambda b: _bullet_time_to_ally(b, ally)
-        )
-        threat_bullets = threat_bullets[: MAX_BULLETS]
-        for b in threat_bullets:
-            dx   = b.x - ally.x
-            dy   = b.y - ally.y
-            dist = math.hypot(dx, dy)
-            bspd = math.hypot(b.vx, b.vy) or 1.0
-            tta  = _bullet_time_to_ally(b, ally)
-            obs[idx]   = dx / CANVAS_W
-            obs[idx+1] = dy / CANVAS_H
-            obs[idx+2] = b.vx / bspd
-            obs[idx+3] = b.vy / bspd
-            obs[idx+4] = dist / MAX_BULLET_DIST
-            obs[idx+5] = tta                    # 预测碰撞时间（0=即将命中）
+        # ── 段4：最多 8 个威胁（子弹 + 地面 AOE，6维/个）────────────────────
+        threat_entries = _collect_threat_entries(ally, self._enemy_bullets, self._hazards)
+        for kind, obj, tta in threat_entries:
+            if kind == "b":
+                b = obj  # type: ignore[assignment]
+                dx   = b.x - ally.x
+                dy   = b.y - ally.y
+                dist = math.hypot(dx, dy)
+                bspd = math.hypot(b.vx, b.vy) or 1.0
+                obs[idx]   = dx / CANVAS_W
+                obs[idx+1] = dy / CANVAS_H
+                obs[idx+2] = b.vx / bspd
+                obs[idx+3] = b.vy / bspd
+                obs[idx+4] = dist / MAX_BULLET_DIST
+                obs[idx+5] = tta
+            else:
+                h = obj  # type: ignore[assignment]
+                dx   = h.x - ally.x
+                dy   = h.y - ally.y
+                dist = math.hypot(dx, dy)
+                ex, ey = _normalize(ally.x - h.x, ally.y - h.y)
+                obs[idx]   = dx / CANVAS_W
+                obs[idx+1] = dy / CANVAS_H
+                obs[idx+2] = ex
+                obs[idx+3] = ey
+                obs[idx+4] = max(0.0, dist - h.r) / MAX_BULLET_DIST
+                obs[idx+5] = tta
             idx += 6
-        idx += (MAX_BULLETS - len(threat_bullets)) * 6
+        idx += (MAX_BULLETS - len(threat_entries)) * 6
 
         # ── 段5：射线检测（16 方向，替换矩形障碍物 obs）─────────────────────
         # 从 ally 向 16 个均匀方向发射射线，返回到障碍物/边界的归一化距离
@@ -660,11 +751,8 @@ class AssaultEnv(gym.Env):
         obs[idx + self._prev_action] = 1.0
         idx += _SEG7
 
-        # ── 段8：最危险子弹 TTA（1维）────────────────────────────────────────
-        if threat_bullets:
-            obs[idx] = min(_bullet_time_to_ally(b, ally) for b in threat_bullets)
-        else:
-            obs[idx] = 1.0
+        # ── 段8：最危险威胁 TTA（子弹或地面 AOE，1维）────────────────────────
+        obs[idx] = threat_entries[0][2] if threat_entries else 1.0
         idx += _SEG8
 
         assert idx == OBS_DIM, f"obs dim mismatch: {idx} != {OBS_DIM}"
@@ -727,9 +815,14 @@ class AssaultEnv(gym.Env):
         #    站在弹道上每帧持续疼 → 移出弹道 threat 下降 → 形成“往哪躲”的稠密梯度。
         threat = 0.0
         for b in self._enemy_bullets:
-            tta = _bullet_time_to_ally(b, ally)          # 不会命中的子弹返回 1.0
+            tta = _bullet_time_to_ally(b, ally)
             if tta < _THREAT_TTA_NORM:
-                threat += 1.0 - tta / _THREAT_TTA_NORM   # [0,1]
+                threat += 1.0 - tta / _THREAT_TTA_NORM
+        for h in self._hazards:
+            tta = _hazard_threat_tta(h, ally)
+            if tta < _THREAT_TTA_NORM:
+                weight = 0.85 if h.warn_t > 0 else 1.0
+                threat += weight * (1.0 - tta / _THREAT_TTA_NORM)
         if threat > 0.0:
             reward -= 0.035 * min(threat, 3.0)           # 弹幕封顶，避免数值爆炸
             if action != 0:                              # 危险时移动 → 打破静止惯性
@@ -836,6 +929,34 @@ class AssaultEnv(gym.Env):
                 best_score = score
                 best = e
         return best
+
+    def _spawn_boss_ground_aoe(self, boss: Enemy) -> None:
+        """与 game/bosses/patterns.js spawnGroundAoE 对齐。"""
+        for _ in range(4):
+            tx = boss.x + random.uniform(-140, 140)
+            ty = boss.y + random.uniform(-100, 100)
+            self._hazards.append(Hazard(
+                x=max(60.0, min(tx, CANVAS_W - 60)),
+                y=max(60.0, min(ty, CANVAS_H - 60)),
+                r=52.0,
+                warn_t=1.05,
+                ttl=1.4,
+                damage=12.0,
+            ))
+
+    def _update_hazards(self) -> None:
+        ally = self._ally
+        kept: list[Hazard] = []
+        for h in self._hazards:
+            h.ttl -= DT
+            if h.warn_t > 0.0:
+                h.warn_t = max(0.0, h.warn_t - DT)
+            elif ally.hp > 0.0:
+                if math.hypot(ally.x - h.x, ally.y - h.y) < h.r + ally.radius:
+                    ally.hp -= h.damage * DT * 2.5
+            if h.ttl > 0.0:
+                kept.append(h)
+        self._hazards = kept
 
     def _update_bullets(self) -> float:
         damage_dealt = 0.0

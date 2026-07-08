@@ -1,6 +1,6 @@
 const NPC_API = "http://127.0.0.1:5100";
-const NPC_AUTONOMY_BUILD = "autonomy9";
-const GAME_BUILD = "upgrade1";
+const NPC_AUTONOMY_BUILD = "autonomy10";
+const GAME_BUILD = "m1_autonomy10";
 
 // ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
 // onnxruntime-web 从 CDN 加载；如需离线部署可改为本地路径。
@@ -119,18 +119,13 @@ async function _rlLoadModel() {
   }
 }
 
-// LOS 射线步进检测（与 env.py _has_line_of_sight 对齐，steps=16）
+// LOS 射线步进检测（含临时障碍，与 env.py _has_line_of_sight 对齐）
 function _rlHasLOS(ax, ay, bx, by) {
-  const steps = 16;
-  for (let i = 1; i < steps; i++) {
-    const t  = i / steps;
-    const px = ax + (bx - ax) * t;
-    const py = ay + (by - ay) * t;
-    for (const o of state.obstacles) {
-      if (px >= o.x && px <= o.x + o.w && py >= o.y && py <= o.y + o.h) return false;
-    }
-  }
-  return true;
+  return window.GameShooting?.hasBulletLOS(ax, ay, bx, by, allObstacles()) ?? true;
+}
+
+function canBulletShoot(from, to, range) {
+  return window.GameShooting?.canShoot(from, to, range, allObstacles()) ?? true;
 }
 
 // 圆盘碰撞 TTA（秒）；未命中或背向返回 BULLET_TTL（与 env.py _bullet_time_to_ally 对齐）
@@ -165,6 +160,39 @@ function _rlBulletTTA(b, ally) {
   return Math.min(1.0, Math.max(0.0, _rlBulletTTASec(b, ally) / _RL_BULLET_TTL));
 }
 
+function _rlHazardTTA(h, ally) {
+  const distC = Math.hypot(ally.x - h.x, ally.y - h.y);
+  const edge = distC - h.r - ally.radius;
+  if (h.warnT > 0) return Math.min(1, (h.warnT / 1.1) * 0.5 + Math.max(0, edge) / 180);
+  if (h.activeT > 0 && edge <= 0) return 0;
+  if (edge <= 0) return 0;
+  return Math.min(1, edge / 120);
+}
+
+function _rlMinHazardTTA() {
+  const ally = state.ally;
+  let min = 1;
+  for (const h of state.hazards || []) {
+    if (Math.hypot(ally.x - h.x, ally.y - h.y) > h.r + _RL_MAX_BULLET_DIST) continue;
+    min = Math.min(min, _rlHazardTTA(h, ally));
+  }
+  return min;
+}
+
+function _rlCollectThreats(ally) {
+  const entries = [];
+  for (const b of state.enemyBullets) {
+    if (Math.hypot(b.x - ally.x, b.y - ally.y) > _RL_MAX_BULLET_DIST) continue;
+    entries.push({ kind: "b", obj: b, tta: _rlBulletTTA(b, ally) });
+  }
+  for (const h of state.hazards || []) {
+    if (Math.hypot(ally.x - h.x, ally.y - h.y) > h.r + _RL_MAX_BULLET_DIST) continue;
+    entries.push({ kind: "h", obj: h, tta: _rlHazardTTA(h, ally) });
+  }
+  entries.sort((a, b) => a.tta - b.tta);
+  return entries.slice(0, _RL_MAX_BULLETS);
+}
+
 function _rlMinBulletTTASec() {
   const ally = state.ally;
   let minSec = _RL_BULLET_TTL;
@@ -176,8 +204,31 @@ function _rlMinBulletTTASec() {
   return minSec;
 }
 
+function _rlBestDodgeAction(ex, ey) {
+  let bestA = 1;
+  let bestDot = -Infinity;
+  for (let i = 1; i < _RL_ACTION_VECTORS.length; i += 1) {
+    const [vx, vy] = _RL_ACTION_VECTORS[i];
+    const dot = vx * ex + vy * ey;
+    if (dot > bestDot) { bestDot = dot; bestA = i; }
+  }
+  return bestA;
+}
+
 function _rlEmergencyDodgeAction() {
   const ally = state.ally;
+  let worstH = null;
+  let worstHTta = Infinity;
+  for (const h of state.hazards || []) {
+    const tta = _rlHazardTTA(h, ally);
+    if (tta >= 0.35) continue;
+    if (tta < worstHTta) { worstHTta = tta; worstH = h; }
+  }
+  if (worstH) {
+    const [ex, ey] = normalize(ally.x - worstH.x, ally.y - worstH.y);
+    return _rlBestDodgeAction(ex, ey);
+  }
+
   let worst = null;
   let worstTta = Infinity;
   for (const b of state.enemyBullets) {
@@ -194,16 +245,7 @@ function _rlEmergencyDodgeAction() {
   const dy = ally.y - worst.y;
   const lateral = -uy * dx + ux * dy;
   const sign = lateral >= 0 ? 1 : -1;
-  const ex = -uy * sign;
-  const ey = ux * sign;
-  let bestA = 1;
-  let bestDot = -Infinity;
-  for (let i = 1; i < _RL_ACTION_VECTORS.length; i += 1) {
-    const [vx, vy] = _RL_ACTION_VECTORS[i];
-    const dot = vx * ex + vy * ey;
-    if (dot > bestDot) { bestDot = dot; bestA = i; }
-  }
-  return bestA;
+  return _rlBestDodgeAction(-uy * sign, ux * sign);
 }
 
 function _rlResolveAction(los, minTtaSec) {
@@ -212,8 +254,10 @@ function _rlResolveAction(los, minTtaSec) {
   // 参数 los 暂保留以兼容调用处签名（当前逻辑不再使用）。
   void los;
 
-  // 1) 紧急闪避：子弹即将命中 → 强制横向规避（最高优先级）
-  const dodge = minTtaSec < _EMERGENCY_DODGE_TTA_SEC ? _rlEmergencyDodgeAction() : null;
+  // 1) 紧急闪避：子弹或地面 AOE → 强制规避（最高优先级）
+  const dodge = (minTtaSec < _EMERGENCY_DODGE_TTA_SEC || _rlMinHazardTTA() < 0.35)
+    ? _rlEmergencyDodgeAction()
+    : null;
   if (dodge !== null) {
     _rlAppliedAction = dodge;
     _rlActionHoldRemain = _MIN_ACTION_HOLD_FRAMES;
@@ -280,7 +324,7 @@ function _rlBuildObs(attackCd) {
   obs[idx++] = state.enemies.length / 11.0;
 
   // ── 段2：主目标敌人（最近，8维）──────────────────────────────────────────
-  const target = _rlNearestEnemy();
+  const target = allyAssaultTarget();
   if (target !== null) {
     const dx   = target.x - ally.x;
     const dy   = target.y - ally.y;
@@ -317,25 +361,36 @@ function _rlBuildObs(attackCd) {
   }
   idx += (_RL_MAX_ENEMIES - 1 - others.length) * 5;
 
-  // ── 段4：最多 8 颗威胁子弹（6维/颗，按 TTA 排序）────────────────────────
-  const threatBullets = state.enemyBullets
-    .filter(b => Math.hypot(b.x - ally.x, b.y - ally.y) < _RL_MAX_BULLET_DIST)
-    .map(b => ({ b, tta: _rlBulletTTA(b, ally) }))
-    .sort((a, b) => a.tta - b.tta)   // TTA 越小越危险，排在前面
-    .slice(0, _RL_MAX_BULLETS);
-  for (const { b, tta } of threatBullets) {
-    const dx   = b.x - ally.x;
-    const dy   = b.y - ally.y;
-    const dist = Math.hypot(dx, dy);
-    const bspd = Math.hypot(b.vx, b.vy) || 1.0;
-    obs[idx++] = dx / _RL_CANVAS_W;
-    obs[idx++] = dy / _RL_CANVAS_H;
-    obs[idx++] = b.vx / bspd;
-    obs[idx++] = b.vy / bspd;
-    obs[idx++] = dist / _RL_MAX_BULLET_DIST;
-    obs[idx++] = tta;                 // 预测碰撞时间（0=即将命中）
+  // ── 段4：最多 8 个威胁（子弹 + 地面 AOE，6维/个）────────────────────────
+  const threatEntries = _rlCollectThreats(ally);
+  for (const { kind, obj, tta } of threatEntries) {
+    if (kind === "b") {
+      const b = obj;
+      const dx = b.x - ally.x;
+      const dy = b.y - ally.y;
+      const dist = Math.hypot(dx, dy);
+      const bspd = Math.hypot(b.vx, b.vy) || 1.0;
+      obs[idx++] = dx / _RL_CANVAS_W;
+      obs[idx++] = dy / _RL_CANVAS_H;
+      obs[idx++] = b.vx / bspd;
+      obs[idx++] = b.vy / bspd;
+      obs[idx++] = dist / _RL_MAX_BULLET_DIST;
+      obs[idx++] = tta;
+    } else {
+      const h = obj;
+      const dx = h.x - ally.x;
+      const dy = h.y - ally.y;
+      const dist = Math.hypot(dx, dy);
+      const [ex, ey] = normalize(ally.x - h.x, ally.y - h.y);
+      obs[idx++] = dx / _RL_CANVAS_W;
+      obs[idx++] = dy / _RL_CANVAS_H;
+      obs[idx++] = ex;
+      obs[idx++] = ey;
+      obs[idx++] = Math.max(0, dist - h.r) / _RL_MAX_BULLET_DIST;
+      obs[idx++] = tta;
+    }
   }
-  idx += (_RL_MAX_BULLETS - threatBullets.length) * 6;
+  idx += (_RL_MAX_BULLETS - threatEntries.length) * 6;
 
   // ── 段5：射线检测（16 方向，替换矩形障碍物 obs）─────────────────────────
   for (const [rdx, rdy] of _RL_RAY_DIRS) {
@@ -352,16 +407,8 @@ function _rlBuildObs(attackCd) {
   obs[idx + _rlPrevAction] = 1.0;
   idx += _RL_N_ACTIONS;
 
-  // ── 段8：最危险子弹 TTA (1维) ────────────────────────────────────────────
-  // 所有威胁子弹中 TTA 最小值，0=即将命中，1=无威胁
-  let minTTA = 1.0;
-  for (const b of state.enemyBullets) {
-    if (Math.hypot(b.x - ally.x, b.y - ally.y) < _RL_MAX_BULLET_DIST) {
-      const tta = _rlBulletTTA(b, ally);
-      if (tta < minTTA) minTTA = tta;
-    }
-  }
-  obs[idx++] = minTTA;
+  // ── 段8：最危险威胁 TTA（子弹或地面 AOE，1维）────────────────────────────
+  obs[idx++] = threatEntries.length ? threatEntries[0].tta : 1.0;
 
   return obs;
 }
@@ -380,6 +427,29 @@ function _rlNearestEnemy() {
     if (score < bestScore) { bestScore = score; best = e; }
   }
   return best;
+}
+
+function allyFocusActive() {
+  const now = performance.now() / 1000;
+  return state.ally.focusMode === "lowest_hp" && state.ally.focusUntil > now;
+}
+
+function findTargetForAlly() {
+  if (allyFocusActive()) {
+    let low = null;
+    state.enemies.forEach((e) => {
+      if (!low || e.hp < low.hp) low = e;
+    });
+    if (low) return low;
+  }
+  const [nearest] = findNearestEnemy(state.ally);
+  return nearest;
+}
+
+/** 突击阶段统一选敌：集火印生效时用最低血量，否则 LOS 加权最近 */
+function allyAssaultTarget() {
+  if (allyFocusActive()) return findTargetForAlly();
+  return _rlNearestEnemy();
 }
 
 // 异步推理：提交本帧 obs，下帧用 _rlRawAction + 后处理层输出实际移动
@@ -429,6 +499,16 @@ function _rlInferAsync(attackCd) {
 const canvas = document.getElementById("gameCanvas");
 const ctx = canvas.getContext("2d");
 const hudStats = document.getElementById("hudStats");
+const playerStatsPanel = document.getElementById("playerStatsPanel");
+const allyStatsPanel = document.getElementById("allyStatsPanel");
+const pactStatsPanel = document.getElementById("pactStatsPanel");
+
+const PLAYER_BASE_SPEED = 220;
+const PLAYER_BASE_DAMAGE = 20;
+const ALLY_BASE_DAMAGE = 20;
+const PLAYER_BASE_DASH_CD = 1.1;
+const PLAYER_BASE_MAX_HP = 200;
+const ALLY_BASE_MAX_HP = 200;
 const chatLog = document.getElementById("chatLog");
 const chatForm = document.getElementById("chatForm");
 const chatInput = document.getElementById("chatInput");
@@ -456,15 +536,16 @@ const FLOOR_META = [
 
 const state = {
   player: {
-    x: 180, y: 260, radius: 14, hp: 160, maxHp: 160, speed: 220,
+    x: 180, y: 260, radius: 14, hp: PLAYER_BASE_MAX_HP, maxHp: PLAYER_BASE_MAX_HP, speed: 220,
     attackCd: 0, shieldCd: 0, dashCd: 0, dashInvuln: 0,
+    silenceT: 0, pullT: 0, pullFrom: null, pullStrength: 0,
   },
   ally: {
     x: 220,
     y: 290,
     radius: 13,
-    hp: 160,
-    maxHp: 160,
+    hp: ALLY_BASE_MAX_HP,
+    maxHp: ALLY_BASE_MAX_HP,
     speed: 200,
     attackCd: 0,
     rescueCd: 0,
@@ -492,30 +573,76 @@ const state = {
   blessingShieldMul: 1,
   blessingsTaken: [],
   blessingChoices: [],
+  blessingPicked: false,
   enemies: [],
   playerBullets: [],
   allyBullets: [],
   enemyBullets: [],
   bossAlive: true,
   obstacles: [],
+  tempObstacles: [],
+  screenFogT: 0,
+  lastPlayerShotDir: null,
   keys: {},
   result: "",
   playerId: "player_web_demo",
   floor: 1,
-  floorState: "playing", // "playing" | "blessing_pick" | "clear"
+  floorState: "playing", // playing | blessing_pick | clear | door_transition
   transitionTimer: 0,
+  dungeon: null,
+  roomIndex: 0,
+  roomCleared: false,
+  doorTransitionTimer: 0,
+  renderSlide: 0,
+  hazards: [],
+  _combatScale: null,
   cinders: [],
 };
 
 // ── 关卡配置 ──────────────────────────────────────────────────────────────────
 
-function floorScale() {
+function floorScale(roomDepth = 0) {
   const f = state.floor - 1;
+  const stacks = (state.blessingsTaken || []).length;
+  const threatMul = 1 + stacks * 0.04;
+  const depthMul = 1 + roomDepth * 0.06;
+  const floorHp = 1 + f * 0.32;
+  const floorDmg = 1 + f * 0.12;
   return {
-    hpMul:    1 + f * 0.30,
-    speedMul: 1 + f * 0.06,
-    mobCount: Math.min(3 + Math.floor(f * 1.2), 10),
+    hpMul:       floorHp * depthMul * threatMul,
+    dmgMul:      floorDmg * depthMul * threatMul,
+    speedMul:    (1 + f * 0.05) * depthMul,
+    shootCdMul:  1 / (1 + f * 0.04),
+    mobHpMul:    1 + f * 0.08,
+    mobDmgMul:   1 + f * 0.10,
+    threatMul,
+    depthMul,
+    floorHp,
+    floorDmg,
   };
+}
+
+function eliteBossHpMul(room) {
+  let mul = 1;
+  if ((room.depth || 0) >= 3) mul *= 1.08;
+  if (state.floor >= 2) mul *= 1.05;
+  if (room.type === "elite") mul *= 1.15;
+  return mul;
+}
+
+function eliteBossDmgMul(scale) {
+  const stacks = (state.blessingsTaken || []).length;
+  return scale.dmgMul * (1 + stacks * 0.05);
+}
+
+function damageToEnemy(enemy, raw) {
+  if (enemy._invuln) return 0;
+  if (enemy.kind === "boss" && enemy._ultWindup > 0) return Math.max(1, Math.ceil(raw * 0.5));
+  return raw;
+}
+
+function currentRoom() {
+  return state.dungeon?.rooms?.[state.roomIndex] ?? null;
 }
 
 const MOB_BASE_POSITIONS = [
@@ -525,45 +652,305 @@ const MOB_BASE_POSITIONS = [
   { x: 850, y: 130 },
 ];
 
-// 在障碍物附近随机采样安全出生点，与 rl/env.py _safe_spawn 逻辑对齐
-function safeSpawnPos(baseX, baseY, radius, fallbackX, fallbackY) {
-  for (let i = 0; i < 20; i += 1) {
-    const x = baseX + (Math.random() - 0.5) * 40;
-    const y = baseY + (Math.random() - 0.5) * 40;
-    if (!collidesWithObstacle(x, y, radius)) return { x, y };
-  }
-  return { x: fallbackX, y: fallbackY };
+function spawnMinX(radius) {
+  return window.GameRoomLayouts?.playerMinX?.(state.roomIndex, radius) ?? radius;
 }
 
-function spawnEnemies(emitNpcEvents = true) {
-  const { hpMul, speedMul, mobCount } = floorScale();
-  const mobs = [];
-  for (let i = 0; i < mobCount; i += 1) {
-    const base = MOB_BASE_POSITIONS[i % MOB_BASE_POSITIONS.length];
-    const pos  = safeSpawnPos(base.x, base.y, 12, 750, 270);
-    mobs.push({
-      kind: "mob",
-      x: pos.x, y: pos.y,
-      hp: Math.round(30 * hpMul),
-      maxHp: Math.round(30 * hpMul),
-      radius: 12,
-      speed: 42 * speedMul,
-      shootCd: Math.random() * 1.0 + 0.8,
-    });
+function isClearSpawn(x, y, radius, opts = {}) {
+  const minX = opts.minX ?? spawnMinX(radius);
+  const maxX = canvas.width - radius;
+  const maxY = canvas.height - radius;
+  if (x < minX || x > maxX || y < radius || y > maxY) return false;
+  if (collidesWithObstacle(x, y, radius)) return false;
+  const pad = opts.separation ?? 6;
+  for (const o of opts.others || []) {
+    const or = o.radius ?? 12;
+    if (Math.hypot(x - o.x, y - o.y) < radius + or + pad) return false;
   }
-  const bossPos = safeSpawnPos(820, 270, 20, 830, 400);
-  mobs.push({
-    kind: "boss",
-    x: bossPos.x, y: bossPos.y,
-    hp: Math.round(200 * hpMul),
-    maxHp: Math.round(200 * hpMul),
-    radius: 20,
-    speed: 32 * speedMul,
-    shootCd: 0.8,
+  return true;
+}
+
+// 优先靠近 prefer，失败则网格扫描可行走区域（与 rl/env.py _safe_spawn 对齐并加强回退）
+function findClearSpawnPos(preferX, preferY, radius, opts = {}) {
+  const minX = opts.minX ?? spawnMinX(radius);
+  const maxX = canvas.width - radius;
+  const maxY = canvas.height - radius;
+  const minY = radius;
+  const pickNearest = (cands) => {
+    let best = null;
+    let bestD = Infinity;
+    cands.forEach(([x, y]) => {
+      if (!isClearSpawn(x, y, radius, { ...opts, minX })) return;
+      const d = Math.hypot(x - preferX, y - preferY);
+      if (d < bestD) {
+        bestD = d;
+        best = { x, y };
+      }
+    });
+    return best;
+  };
+
+  for (const spread of [24, 48, 80, 130, 180]) {
+    for (let i = 0; i < 28; i += 1) {
+      const ang = Math.random() * Math.PI * 2;
+      const dist = Math.random() * spread;
+      const x = preferX + Math.cos(ang) * dist;
+      const y = preferY + Math.sin(ang) * dist;
+      if (isClearSpawn(x, y, radius, { ...opts, minX })) return { x, y };
+    }
+  }
+
+  const gridCands = [];
+  for (let y = minY; y <= maxY; y += 26) {
+    for (let x = minX; x <= maxX; x += 26) gridCands.push([x, y]);
+  }
+  let pos = pickNearest(gridCands);
+  if (pos) return pos;
+
+  const fineCands = [];
+  for (let y = minY; y <= maxY; y += 14) {
+    for (let x = minX; x <= maxX; x += 14) fineCands.push([x, y]);
+  }
+  pos = pickNearest(fineCands);
+  if (pos) return pos;
+
+  for (let y = minY; y <= maxY; y += 14) {
+    for (let x = minX; x <= maxX; x += 14) {
+      if (isClearSpawn(x, y, radius, { ...opts, minX })) return { x, y };
+    }
+  }
+
+  const openX = minX + (maxX - minX) * 0.55;
+  const openY = minY + (maxY - minY) * 0.5;
+  return { x: openX, y: openY };
+}
+
+function safeSpawnPos(baseX, baseY, radius, fallbackX, fallbackY, others = []) {
+  return findClearSpawnPos(baseX, baseY, radius, { others });
+}
+
+function relocateStuckEnemies(enemies) {
+  enemies.forEach((e, idx) => {
+    if (!collidesWithObstacle(e.x, e.y, e.radius)) return;
+    const others = enemies.filter((_, j) => j !== idx);
+    const pos = findClearSpawnPos(e.x, e.y, e.radius, { others });
+    e.x = pos.x;
+    e.y = pos.y;
   });
-  state.enemies = mobs;
-  state.bossAlive = true;
-  if (emitNpcEvents) npcPushEvent("boss_spawn", { floor: state.floor });
+}
+
+function spawnRoomEnemies(room) {
+  const scale = floorScale(room.depth);
+  state._combatScale = scale;
+  const scatter = [
+    { x: 520, y: 120 }, { x: 650, y: 150 }, { x: 780, y: 100 },
+    { x: 560, y: 380 }, { x: 700, y: 430 }, { x: 820, y: 360 },
+    { x: 700, y: 270 }, { x: 480, y: 200 }, { x: 600, y: 200 },
+    { x: 750, y: 320 },
+  ];
+  let si = 0;
+  const mkMob = (elite, baseX, baseY, opts = {}) => {
+    const base = baseX != null
+      ? { x: baseX, y: baseY }
+      : scatter[si++ % scatter.length];
+    const r = elite ? 14 : 12;
+    const pos = findClearSpawnPos(base.x, base.y, r, { others: enemies });
+    let hpBase = elite ? 155 : 32;
+    if (opts.guard) hpBase = Math.round(32 * 1.2);
+    let hpMul = scale.hpMul;
+    if (elite || opts.guard) {
+      hpMul *= eliteBossHpMul(room);
+    } else {
+      hpMul *= scale.mobHpMul;
+    }
+    const dmgMul = elite
+      ? eliteBossDmgMul(scale)
+      : scale.dmgMul * scale.mobDmgMul;
+    const enemy = {
+      kind: elite ? "elite" : "mob",
+      x: pos.x, y: pos.y,
+      hp: Math.round(hpBase * hpMul),
+      maxHp: Math.round(hpBase * hpMul),
+      radius: r,
+      speed: 42 * scale.speedMul * (elite ? 0.92 : 1),
+      shootCd: Math.random() * 0.8 + 0.5,
+      dmgMul,
+      shootCdMul: scale.shootCdMul,
+      isGuard: !!opts.guard,
+    };
+    if (elite) {
+      const fierce = Math.random() < 0.1;
+      if (fierce) {
+        enemy._fierce = true;
+        enemy.hp = Math.round(enemy.hp * 1.3);
+        enemy.maxHp = enemy.hp;
+      }
+      window.GameEnemyAI?.initEnemy(enemy, state.floor, room.index);
+      if (fierce) enemy.eliteName += "·厉";
+    } else {
+      window.GameEnemyAI?.initEnemy(enemy, state.floor, room.index);
+    }
+    return enemy;
+  };
+
+  const enemies = [];
+  const spawns = window.GameRoomLayouts.getSpawnPoints(room.type, room.index);
+
+  if (room.boss) {
+    (spawns.guards || []).forEach((g) => {
+      enemies.push(mkMob(false, g.x, g.y, { guard: true }));
+    });
+    const bossMeta = window.GameBosses.getForFloor(state.floor);
+    const bp = spawns.boss || { x: 720, y: 270 };
+    const pos = findClearSpawnPos(bp.x, bp.y, 20, { others: enemies });
+    const bossHpMul = scale.hpMul * bossMeta.hpMul * eliteBossHpMul(room);
+    const boss = {
+      kind: "boss",
+      bossName: bossMeta.name,
+      ultName: bossMeta.ult,
+      skillId: bossMeta.skillId,
+      skillName: bossMeta.skillName,
+      x: pos.x, y: pos.y,
+      hp: Math.round(380 * bossHpMul),
+      maxHp: Math.round(380 * bossHpMul),
+      radius: 20,
+      speed: 32 * scale.speedMul,
+      shootCd: 1.0,
+      dmgMul: eliteBossDmgMul(scale),
+      shootCdMul: scale.shootCdMul,
+      fanChance: bossMeta.fanChance,
+      ultInterval: bossMeta.ultInterval,
+      ultCd: 1.8,
+      aoeColor: bossMeta.aoeColor,
+    };
+    window.GameEnemyAI?.initEnemy(boss, state.floor, room.index);
+    window.GameBossPatterns?.spawnEntranceAoE?.(state, boss);
+    enemies.push(boss);
+    npcPushEvent("boss_spawn", { floor: state.floor });
+  } else {
+    for (let i = 0; i < (room.mobs || 0); i += 1) enemies.push(mkMob(false));
+    for (let i = 0; i < (room.elite || 0); i += 1) enemies.push(mkMob(true));
+    if (enemies.length === 0) enemies.push(mkMob(false));
+  }
+
+  relocateStuckEnemies(enemies);
+  state.enemies = enemies;
+  state.bossAlive = enemies.some((e) => e.kind === "boss");
+}
+
+window.GameSpawn = { findClearSpawnPos, isClearSpawn, relocateStuckEnemies };
+
+function loadRoom(index) {
+  if (!state.dungeon?.rooms?.[index]) return;
+  state.roomIndex = index;
+  const room = currentRoom();
+  state.playerBullets = [];
+  state.allyBullets = [];
+  state.enemyBullets = [];
+  state.hazards = [];
+  state.tempObstacles = [];
+  state.screenFogT = 0;
+  state.player.silenceT = 0;
+  state.player.pullT = 0;
+  state.player.pullFrom = null;
+  state.obstacles = window.GameRoomLayouts.getObstacles(room);
+  rebuildNavGrid();
+
+  const sp = window.GameRoomLayouts.getSpawnPoints(room.type, room.index);
+  state.player.x = sp.player.x;
+  state.player.y = sp.player.y;
+  state.ally.x = sp.ally.x;
+  state.ally.y = sp.ally.y;
+
+  if (_rlLoadState === "ready") _rlResetLstmState();
+  state.ally.combatPhase = "approach";
+  state.ally.navPath = null;
+  state.ally.engagePoint = null;
+  state.ally.losStableFrames = 0;
+  state.ally.losLostFrames = 0;
+
+  spawnRoomEnemies(room);
+  state._brandAnchorCd = room.type === "elite" ? 12 : 0;
+  state.roomCleared = false;
+  room.cleared = false;
+  state.dungeon.maxRoomIndex = Math.max(state.dungeon.maxRoomIndex ?? 0, index);
+  if (index > 0) {
+    npcPurgeEvents("room_cleared", "floor_clear");
+    npcIO.abortCtrl?.abort();
+    npcPushEvent("room_enter", { label: room.label, index, type: room.type });
+  }
+
+  const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
+  if (room.boss) {
+    const bm = window.GameBosses.getForFloor(state.floor);
+    setAllyBubble(`${meta.name} · ${bm.name}：${bm.ult}预备。`);
+  } else if (room.type === "entrance") {
+    setAllyBubble(`第 ${state.floor} 层 ${meta.name}。清完再往前。`);
+  } else {
+    setAllyBubble(`${room.label}。清完开门。`);
+  }
+}
+
+function initFloorDungeon() {
+  state.dungeon = { rooms: window.GameDungeonGen.generate(state.floor) };
+  state.roomIndex = 0;
+  state.hazards = [];
+  state.doorTransitionTimer = 0;
+  state.renderSlide = 0;
+  loadRoom(0);
+}
+
+function onRoomCleared() {
+  const room = currentRoom();
+  if (!room || state.roomCleared) return;
+  room.cleared = true;
+  state.roomCleared = true;
+  if (room.boss) {
+    showBlessingPick();
+    setAllyBubble("本层首领已灭。择狱印后继续。");
+    return;
+  }
+  window.GameFx.floatText(state.player.x, state.player.y - 36, "门已开", "#ffe08a");
+  npcPushEvent("room_cleared", { label: room.label, index: state.roomIndex });
+  npcPushEvent("floor_clear", { label: room.label, index: state.roomIndex });
+  if (room.type === "elite") {
+    state.player.hp = Math.min(state.player.maxHp, state.player.hp + 15);
+    setAllyBubble("精英已斩。下一间。");
+  }
+}
+
+function tryEnterDoor() {
+  if (!state.roomCleared || state.floorState !== "playing" || state.result) return;
+  if (state.enemies.length > 0) return;
+  const room = currentRoom();
+  if (!room || room.index >= state.dungeon.rooms.length - 1) return;
+  const door = window.GameRoomLayouts.getDoorRect(canvas.width, canvas.height);
+  const p = state.player;
+  const nearX = Math.max(door.x, Math.min(p.x, door.x + door.w));
+  const nearY = Math.max(door.y, Math.min(p.y, door.y + door.h));
+  if (Math.hypot(p.x - nearX, p.y - nearY) >= p.radius) return;
+  const nextRoom = state.dungeon.rooms[state.roomIndex + 1];
+  npcPurgeEvents("room_cleared");
+  npcIO.abortCtrl?.abort();
+  state.floorState = "door_transition";
+  state.renderSlide = 0;
+  window.GameDoorTransition.start({
+    door,
+    nextLabel: nextRoom?.label || "下一间",
+    nextIndex: state.roomIndex + 1,
+    playerX: p.x,
+    playerY: p.y,
+  });
+}
+
+function updateDoorTransition(dt) {
+  if (state.floorState !== "door_transition") return;
+  const result = window.GameDoorTransition.update(dt, state);
+  if (result.done) {
+    loadRoom(result.nextIndex);
+    state.floorState = "playing";
+    state.renderSlide = 0;
+  }
 }
 
 // ── 障碍物（布局见 obstacles/layouts.js，碰撞盒不变）────────────────────────────
@@ -571,14 +958,33 @@ function spawnEnemies(emitNpcEvents = true) {
 // assault APPROACH 阶段的 A* 导航栅格（障碍物变更时重建）
 let _navGrid = null;
 
+function allObstacles() {
+  return [...state.obstacles, ...(state.tempObstacles || [])];
+}
+
+function rebuildNavGrid() {
+  _navGrid = buildNavGrid(allObstacles(), state.ally.radius, canvas.width, canvas.height);
+}
+
+state._rebuildNav = rebuildNavGrid;
+
+const _enemyAIHelpers = {
+  moveWithCollision,
+  allObstacles,
+  getNavGrid: () => _navGrid,
+};
+
 function generateObstacles() {
-  state.obstacles = window.GameObstacles.getForFloor(state.floor);
-  _navGrid = buildNavGrid(state.obstacles, state.ally.radius, canvas.width, canvas.height);
+  const room = currentRoom();
+  state.obstacles = room
+    ? window.GameRoomLayouts.getObstacles(room)
+    : window.GameObstacles.getForFloor(state.floor);
+  rebuildNavGrid();
 }
 
 // 圆形实体与矩形障碍物碰撞检测
 function collidesWithObstacle(cx, cy, radius) {
-  return state.obstacles.some((o) => {
+  return allObstacles().some((o) => {
     const nearX = Math.max(o.x, Math.min(cx, o.x + o.w));
     const nearY = Math.max(o.y, Math.min(cy, o.y + o.h));
     return Math.hypot(cx - nearX, cy - nearY) < radius;
@@ -587,7 +993,7 @@ function collidesWithObstacle(cx, cy, radius) {
 
 // 子弹（点）与障碍物碰撞
 function bulletHitsObstacle(bx, by) {
-  return state.obstacles.some(
+  return allObstacles().some(
     (o) => bx >= o.x && bx <= o.x + o.w && by >= o.y && by <= o.y + o.h
   );
 }
@@ -595,7 +1001,8 @@ function bulletHitsObstacle(bx, by) {
 // 带障碍物分量滑动的移动辅助
 function moveWithCollision(entity, dx, dy) {
   const r = entity.radius;
-  const newX = clampUnit(entity.x + dx, r, canvas.width - r);
+  const minX = window.GameRoomLayouts?.playerMinX?.(state.roomIndex, r) ?? r;
+  const newX = clampUnit(entity.x + dx, minX, canvas.width - r);
   const newY = clampUnit(entity.y + dy, r, canvas.height - r);
   if (!collidesWithObstacle(newX, newY, r)) {
     entity.x = newX;
@@ -625,8 +1032,7 @@ function nextFloor() {
   state.ally.engagePoint = null;
   state.ally.losStableFrames = 0;
   state.ally.losLostFrames = 0;
-  generateObstacles();
-  spawnEnemies();
+  initFloorDungeon();
   const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
   setAllyBubble(`第 ${state.floor} 层 ${meta.name}。${meta.hint}`);
 }
@@ -636,6 +1042,8 @@ function updateFloorTransition(dt) {
   state.transitionTimer -= dt;
   if (state.transitionTimer <= 0) {
     state.floor += 1;
+    npcPurgeEvents("room_cleared", "blessing_picked", "floor_clear");
+    npcIO.abortCtrl?.abort();
     npcPushEvent("floor_enter", { floor: state.floor });
     nextFloor();
     state.floorState = "playing";
@@ -644,8 +1052,7 @@ function updateFloorTransition(dt) {
 
 // ── 初始化第一关 ──────────────────────────────────────────────────────────────
 
-generateObstacles();
-spawnEnemies(false); // 脚本前部初始化，NPC 模块尚未就绪
+initFloorDungeon();
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -724,26 +1131,39 @@ function findNearestEnemy(from) {
   return [nearest, minDist];
 }
 
-function gameInputBlocked() {
-  return !!state.result || state.floorState === "blessing_pick";
+/** 射程内且视线通畅的最近敌人（用于子弹类攻击选目标） */
+function findNearestEnemyInSight(from, range) {
+  let nearest = null;
+  let minDist = Number.POSITIVE_INFINITY;
+  state.enemies.forEach((enemy) => {
+    const d = distance(from, enemy);
+    if (d >= minDist) return;
+    if (!canBulletShoot(from, enemy, range)) return;
+    minDist = d;
+    nearest = enemy;
+  });
+  return [nearest, minDist];
 }
 
-function findTargetForAlly() {
-  const now = performance.now() / 1000;
-  if (state.ally.focusMode === "lowest_hp" && state.ally.focusUntil > now) {
-    let low = null;
-    state.enemies.forEach((e) => {
-      if (!low || e.hp < low.hp) low = e;
-    });
-    if (low) return low;
-  }
-  const [nearest] = findNearestEnemy(state.ally);
-  return nearest;
+function gameInputBlocked() {
+  return !!state.result
+    || state.floorState === "blessing_pick"
+    || state.floorState === "door_transition";
+}
+
+function blessingCardHtml(b) {
+  const { faction, kind } = window.GameBlessings.meta(b);
+  return `
+    <span class="blessing-badge blessing-badge--${faction.css}">${faction.label}</span>
+    <span class="blessing-kind">${kind.label} · ${kind.hint}</span>
+    <strong>${b.name}</strong>
+    <span class="blessing-desc">${b.desc}</span>`;
 }
 
 function showBlessingPick() {
   state.floorState = "blessing_pick";
-  state.blessingChoices = window.GameBlessings.pickThree();
+  state.blessingPicked = false;
+  state.blessingChoices = window.GameBlessings.pickThree(state);
   const overlay = document.getElementById("blessingOverlay");
   const container = document.getElementById("blessingChoices");
   if (!overlay || !container) {
@@ -751,37 +1171,83 @@ function showBlessingPick() {
     state.transitionTimer = 2.5;
     return;
   }
+  overlay.classList.remove("hidden", "picked");
   container.innerHTML = "";
+  if (state.blessingChoices.length === 0) {
+    state.floorState = "clear";
+    state.transitionTimer = 2.5;
+    overlay.classList.add("hidden");
+    return;
+  }
   state.blessingChoices.forEach((b, i) => {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "blessing-card";
-    btn.innerHTML = `<strong>${b.name}</strong><span>${b.desc}</span>`;
+    const fcss = window.GameBlessings.FACTION[b.faction]?.css || "soul";
+    btn.className = `blessing-card blessing-card--${fcss}`;
+    btn.innerHTML = blessingCardHtml(b);
     btn.addEventListener("click", () => pickBlessing(i));
     container.appendChild(btn);
   });
-  overlay.classList.remove("hidden");
 }
 
 function pickBlessing(idx) {
+  if (state.blessingPicked || state.floorState !== "blessing_pick") return;
+  state.blessingPicked = true;
+
+  const overlay = document.getElementById("blessingOverlay");
+  const container = document.getElementById("blessingChoices");
+  if (overlay) overlay.classList.add("picked");
+  container?.querySelectorAll(".blessing-card").forEach((btn) => {
+    btn.disabled = true;
+  });
+
   const b = state.blessingChoices[idx];
   if (b) window.GameBlessings.apply(state, b);
-  const overlay = document.getElementById("blessingOverlay");
+  syncAllyLifeState();
+
   if (overlay) overlay.classList.add("hidden");
+  if (container) container.innerHTML = "";
+  state.blessingChoices = [];
   state.floorState = "clear";
   state.transitionTimer = 2.5;
-  npcPushEvent("floor_clear", { floor: state.floor });
-  setAllyBubble(b ? `狱印「${b.name}」已铭刻，下一层见。` : "下一层见。");
+  if (b) {
+    npcIO.blessingJustPicked = {
+      name: b.name,
+      faction: b.faction,
+      desc: (b.desc || "").slice(0, 40),
+    };
+    npcPushEvent("blessing_picked", { name: b.name, faction: b.faction });
+  }
+  updateStatsPanels();
 }
 
 // ── 游戏逻辑更新 ──────────────────────────────────────────────────────────────
 
+function applyKillHeal(killer, amount) {
+  if (!killer || amount <= 0) return;
+  const before = killer.hp;
+  killer.hp = Math.min(killer.maxHp, killer.hp + amount);
+  const gained = Math.round(killer.hp - before);
+  if (gained > 0) {
+    window.GameFx.floatText(killer.x, killer.y - 40, `+${gained}`, "#7ee88a");
+    window.GameFx.burst(killer.x, killer.y, "#7ee88a", 4);
+  }
+}
+
 function removeDeadEnemies() {
   const dead = state.enemies.filter((e) => e.hp <= 0);
   if (dead.length > 0) {
+    const gb = window.GameBlessings;
     dead.forEach((e) => {
       window.GameFx.burst(e.x, e.y, e.kind === "boss" ? "#ffaa88" : "#ffb366", e.kind === "boss" ? 14 : 7);
       if (e.kind === "boss") window.GameFx.shake(5, 0.18);
+      if (e._lastHitBy === "player" && state.player.hp > 0) {
+        const heal = gb?.killHealAmount(state, state.player) ?? 0;
+        if (heal > 0) applyKillHeal(state.player, heal);
+      } else if (e._lastHitBy === "ally" && state.ally.hp > 0) {
+        const heal = gb?.killHealAmount(state, state.ally) ?? 0;
+        if (heal > 0) applyKillHeal(state.ally, heal);
+      }
     });
     state.combo += dead.length;
     state.comboTimer = 2.2;
@@ -792,8 +1258,7 @@ function removeDeadEnemies() {
   state.enemies = state.enemies.filter((e) => e.hp > 0);
   state.bossAlive = state.enemies.some((e) => e.kind === "boss");
   if (state.enemies.length === 0 && state.floorState === "playing" && !state.result) {
-    showBlessingPick();
-    setAllyBubble(`第 ${state.floor} 层清除！挑一枚狱印再走。`);
+    onRoomCleared();
   }
 }
 
@@ -804,10 +1269,14 @@ function createBullet(owner, from, to, speed, damage) {
 
 function playerAttack() {
   if (state.player.attackCd > 0 || gameInputBlocked() || state.floorState === "clear") return;
-  const [target] = findNearestEnemy(state.player);
+  if (state.player.silenceT > 0) return;
+  const playerRange = window.GameShooting?.RANGES.player ?? 480;
+  const [target] = findNearestEnemyInSight(state.player, playerRange);
   if (!target) return;
-  const dmg = Math.max(1, Math.round(18 * (state.playerDamageMul || 1)));
+  const dmg = Math.max(1, Math.round(PLAYER_BASE_DAMAGE * (state.playerDamageMul || 1)));
   state.player.attackCd = 0.3;
+  const [dx, dy] = normalize(target.x - state.player.x, target.y - state.player.y);
+  state.lastPlayerShotDir = [dx, dy];
   state.playerBullets.push(createBullet("player", state.player, target, 430, dmg));
   npcMarkPlayerAction();
 }
@@ -849,14 +1318,17 @@ function updatePlayer(dt) {
     state.comboTimer -= dt;
     if (state.comboTimer <= 0) state.combo = 0;
   }
+  tryEnterDoor();
 }
 
 function allyConfig() {
   if (state.ally.stance === "assault") {
-    return { attackRange: 110, kiteRange: 65, interval: 0.45, speedMul: 1.2, damage: 13 };
+    return {
+      attackRange: 110, kiteRange: 65, interval: 0.45, speedMul: 1.2, damage: ALLY_BASE_DAMAGE,
+    };
   }
   // guard（默认）
-  return { attackRange: 0, kiteRange: 0, interval: 0.75, speedMul: 1.0, damage: 10 };
+  return { attackRange: 0, kiteRange: 0, interval: 0.75, speedMul: 1.0, damage: ALLY_BASE_DAMAGE };
 }
 
 // 在敌人环带上选 A* 可达、有 LOS 的交战锚点（寻路终点，非敌人中心）
@@ -892,12 +1364,13 @@ function maybeReplanNav(target, dt) {
   if (a.navReplanCd > 0 && moved < 36) return;
   a.navReplanCd = 0.35;
   a.navGoal = { x: target.x, y: target.y };
-  if (!_navGrid) _navGrid = buildNavGrid(state.obstacles, a.radius, canvas.width, canvas.height);
+  if (!_navGrid) _navGrid = buildNavGrid(allObstacles(), a.radius, canvas.width, canvas.height);
   const raw = findPath(_navGrid, a, target);
-  a.navPath = raw ? smoothPath(raw, state.obstacles, a.radius) : null;
+  a.navPath = raw ? smoothPath(raw, allObstacles(), a.radius) : null;
 }
 
 function updateAlly(dt) {
+  syncAllyLifeState({ announce: false });
   const cfg = allyConfig();
   state.ally.attackCd = Math.max(0, state.ally.attackCd - dt);
   state.ally.rescueCd = Math.max(0, state.ally.rescueCd - dt);
@@ -911,14 +1384,18 @@ function updateAlly(dt) {
     }
     const target = findTargetForAlly();
     if (target && state.ally.attackCd <= 0) {
-      state.allyBullets.push(createBullet("ally", state.ally, target, 380, cfg.damage));
-      state.ally.attackCd = cfg.interval;
+      if (canBulletShoot(state.ally, target, window.GameShooting?.RANGES.ally_guard)) {
+        state.allyBullets.push(createBullet("ally", state.ally, target, 380, cfg.damage));
+        state.ally.attackCd = cfg.interval;
+      } else {
+        state.ally.attackCd = window.GameShooting?.RETRY_CD ?? 0.25;
+      }
     }
 
   } else if (state.ally.stance === "assault") {
     if (_rlLoadState === "idle") _rlLoadModel();
 
-    const target = _rlNearestEnemy();
+    const target = allyAssaultTarget();
     if (target) {
       const d   = distance(state.ally, target);
       const los = _rlHasLOS(state.ally.x, state.ally.y, target.x, target.y);
@@ -936,7 +1413,7 @@ function updateAlly(dt) {
         // ── APPROACH：A* 绕障接近交战锚点，到位且 LOS 稳定后把控制权交给 RL ──
         maybeReplanNav(engagePt, dt);
         const [mx, my] = state.ally.navPath
-          ? steerAlong(state.ally.navPath, state.ally, state.obstacles, state.ally.radius)
+          ? steerAlong(state.ally.navPath, state.ally, allObstacles(), state.ally.radius)
           : [0, 0];
         moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
 
@@ -971,16 +1448,21 @@ function updateAlly(dt) {
       }
 
       if (state.ally.attackCd <= 0) {
-        state.allyBullets.push(createBullet("ally", state.ally, target, 400, cfg.damage));
-        state.ally.attackCd = cfg.interval;
+        if (canBulletShoot(state.ally, target, cfg.attackRange)) {
+          state.allyBullets.push(createBullet("ally", state.ally, target, 400, cfg.damage));
+          state.ally.attackCd = cfg.interval;
+        } else {
+          state.ally.attackCd = window.GameShooting?.RETRY_CD ?? 0.25;
+        }
       }
     }
 
   }
 
-  // 边界夹紧
-  state.ally.x = clampUnit(state.ally.x, 10, canvas.width - 10);
-  state.ally.y = clampUnit(state.ally.y, 10, canvas.height - 10);
+  const allyR = state.ally.radius;
+  const allyMinX = window.GameRoomLayouts?.playerMinX?.(state.roomIndex, allyR) ?? 10;
+  state.ally.x = clampUnit(state.ally.x, allyMinX, canvas.width - allyR);
+  state.ally.y = clampUnit(state.ally.y, allyR, canvas.height - allyR);
 
   if (state.player.hp <= 45 && state.ally.rescueCd <= 0 && state.ally.stance !== "assault") {
     state.player.hp = Math.min(state.player.maxHp, state.player.hp + 28);
@@ -992,34 +1474,11 @@ function updateAlly(dt) {
 
 function updateEnemies(dt) {
   if (state.floorState !== "playing") return;
+  if (state.result) return;
+  window.GameEnemyAI.tickCombatMotion?.(state, dt);
+  window.GameEnemyAI.updateEliteRoomAnchors?.(state, dt, _enemyAIHelpers);
   state.enemies.forEach((enemy) => {
-    enemy.shootCd = Math.max(0, enemy.shootCd - dt);
-    if (state.result) return;
-    if (window.GameBullets.tickWarn(enemy, dt)) return;
-
-    const distToPlayer = distance(enemy, state.player);
-    const distToAlly = state.ally.hp > 0 ? distance(enemy, state.ally) : Number.POSITIVE_INFINITY;
-    const primary = distToPlayer <= distToAlly ? state.player : state.ally;
-    const [nx, ny] = normalize(primary.x - enemy.x, primary.y - enemy.y);
-    moveWithCollision(enemy, nx * enemy.speed * dt, ny * enemy.speed * dt);
-
-    if (enemy.shootCd <= 0) {
-      const bulletSpeed = enemy.kind === "boss" ? 200 : 170;
-      const bulletDamage = enemy.kind === "boss" ? 9 : 5;
-      if (enemy.kind === "boss" && Math.random() < 0.38) {
-        window.GameBullets.startWarn(enemy, 0.45);
-        enemy._pendingFan = { primary, bulletSpeed, bulletDamage };
-        enemy.shootCd = 0.5;
-      } else {
-        window.GameBullets.aimedShot(state.enemyBullets, enemy, primary, bulletSpeed, bulletDamage);
-        enemy.shootCd = enemy.kind === "boss" ? 1.2 : 1.6;
-      }
-    } else if (enemy._pendingFan && !enemy.warnT) {
-      const p = enemy._pendingFan;
-      window.GameBullets.fanShot(state.enemyBullets, enemy, p.primary, p.bulletSpeed, p.bulletDamage, 42, 5);
-      enemy._pendingFan = null;
-      enemy.shootCd = 1.35;
-    }
+    window.GameEnemyAI.updateEnemyCombat(enemy, dt, state, _enemyAIHelpers);
   });
 }
 
@@ -1050,9 +1509,13 @@ function updateBullets(dt) {
     for (let j = 0; j < state.enemies.length; j += 1) {
       const e = state.enemies[j];
       if (distance(b, e) <= b.radius + e.radius) {
-        e.hp -= b.damage;
-        window.GameFx.burst(b.x, b.y, "#6bc8ff", 4);
-        window.GameFx.floatText(e.x, e.y - 18, String(b.damage), "#9fe4ff");
+        const dmg = damageToEnemy(e, b.damage);
+        if (dmg > 0) {
+          e.hp -= dmg;
+          e._lastHitBy = "player";
+          window.GameFx.burst(b.x, b.y, "#6bc8ff", 4);
+          window.GameFx.floatText(e.x, e.y - 18, String(dmg), "#9fe4ff");
+        }
         hit = true;
         break;
       }
@@ -1066,7 +1529,11 @@ function updateBullets(dt) {
     for (let j = 0; j < state.enemies.length; j += 1) {
       const e = state.enemies[j];
       if (distance(b, e) <= b.radius + e.radius) {
-        e.hp -= b.damage;
+        const dmg = damageToEnemy(e, b.damage);
+        if (dmg > 0) {
+          e.hp -= dmg;
+          e._lastHitBy = "ally";
+        }
         window.GameFx.burst(b.x, b.y, "#9af19b", 4);
         hit = true;
         break;
@@ -1081,7 +1548,7 @@ function updateBullets(dt) {
     if (distance(b, state.player) <= b.radius + state.player.radius) {
       if (state.player.dashInvuln <= 0) {
         const raw = b.damage;
-        const guardNear = state.ally.stance === "guard" && !state.ally.dead
+        const guardNear = state.ally.stance === "guard" && state.ally.hp > 0
           && distance(state.ally, state.player) <= 80;
         let final = raw;
         if (state.player.shieldCd > 0) final = Math.max(2, Math.floor(raw * 0.3));
@@ -1096,6 +1563,20 @@ function updateBullets(dt) {
     }
     if (consumed) state.enemyBullets.splice(i, 1);
   }
+}
+
+function syncAllyLifeState(opts = {}) {
+  const a = state.ally;
+  if (a.hp > 0 && a.dead) {
+    a.dead = false;
+    if (opts.announce !== false) {
+      setAllyBubble("灵核回稳，我还能跟上。");
+    }
+  }
+}
+
+function allyIsDown() {
+  return state.ally.hp <= 0;
 }
 
 function checkDefeat() {
@@ -1178,7 +1659,193 @@ function drawBackground(dt) {
 
 function drawObstacles() {
   const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
-  window.GameObstacles.draw(ctx, state.obstacles, meta);
+  window.GameObstacles.draw(ctx, allObstacles(), meta);
+}
+
+function drawWestSeal() {
+  if (state.roomIndex <= 0) return;
+  const seal = window.GameRoomLayouts.getWestSealRect();
+  const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
+  ctx.fillStyle = `${meta.tone}66`;
+  ctx.fillRect(seal.x, seal.y, seal.w, seal.h);
+  ctx.strokeStyle = `${meta.accent}55`;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(seal.x + seal.w - 4, seal.y, 4, seal.h);
+  ctx.lineWidth = 1;
+  ctx.font = "bold 11px PingFang SC, Arial, sans-serif";
+  ctx.fillStyle = `${meta.accent}99`;
+  ctx.textAlign = "center";
+  ctx.save();
+  ctx.translate(seal.w / 2, seal.h * 0.42);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("来路已封", 0, 0);
+  ctx.restore();
+  ctx.textAlign = "left";
+}
+
+function drawRoomExit() {
+  const room = currentRoom();
+  if (!room || room.index >= state.dungeon.rooms.length - 1) return;
+  const door = window.GameRoomLayouts.getDoorRect(canvas.width, canvas.height);
+  const cleared = state.roomCleared && state.enemies.length === 0;
+  const pulse = 0.4 + Math.sin(performance.now() / 140) * 0.2;
+  const cx = door.x + door.w / 2;
+  const cy = door.y + door.h / 2;
+
+  if (cleared) {
+    ctx.fillStyle = `rgba(255, 190, 120, ${pulse * 0.35})`;
+    ctx.fillRect(door.x, door.y, door.w, door.h);
+    ctx.strokeStyle = `rgba(255, 220, 160, ${pulse})`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(door.x, door.y, door.w, door.h);
+    ctx.strokeStyle = `rgba(255, 235, 200, ${0.7 + pulse * 0.3})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, cy - 8);
+    ctx.lineTo(cx + 2, cy);
+    ctx.lineTo(cx - 6, cy + 8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx + 2, cy - 8);
+    ctx.lineTo(cx + 10, cy);
+    ctx.lineTo(cx + 2, cy + 8);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.font = "11px PingFang SC, Arial, sans-serif";
+    ctx.fillStyle = "#ffe8c8";
+    ctx.textAlign = "center";
+    ctx.fillText("前行", cx, door.y + door.h - 12);
+  } else {
+    ctx.fillStyle = "rgba(30, 28, 38, 0.55)";
+    ctx.fillRect(door.x, door.y, door.w, door.h);
+    ctx.strokeStyle = "rgba(80, 75, 95, 0.85)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(door.x, door.y, door.w, door.h);
+    ctx.lineWidth = 1;
+    ctx.font = "bold 14px PingFang SC, Arial, sans-serif";
+    ctx.fillStyle = "rgba(140, 135, 155, 0.9)";
+    ctx.textAlign = "center";
+    ctx.fillText("封", cx, cy + 5);
+  }
+  ctx.textAlign = "left";
+}
+
+function drawEntityLabel(entity, text, color) {
+  ctx.font = "bold 11px Segoe UI";
+  ctx.textAlign = "center";
+  ctx.fillStyle = color;
+  ctx.fillText(text, entity.x, entity.y - entity.radius - 14);
+  ctx.textAlign = "left";
+}
+
+/** 乌枭：鬼差高冠 + 黑签披风，与狱卒形貌区分 */
+function drawAllySprite(entity, dir = 1) {
+  const px = 4;
+  const originX = Math.floor(entity.x - 7 * px);
+  const originY = Math.floor(entity.y - 10 * px);
+  const rows = [
+    "0001111000",
+    "0011221100",
+    "0112332110",
+    "0012332100",
+    "0001441000",
+    "0114544110",
+    "1144444411",
+    "0154544510",
+    "0015005100",
+    "0006006000",
+  ];
+  const map = {
+    "1": "#1a3020",
+    "2": "#d4b896",
+    "3": "#9af5a0",
+    "4": "#2d5a38",
+    "5": "#7ee88a",
+    "6": "#1a1a22",
+  };
+
+  rows.forEach((row, rowIdx) => {
+    [...row].forEach((cell, colIdx) => {
+      if (cell === "0") return;
+      const drawCol = dir > 0 ? colIdx : row.length - colIdx - 1;
+      ctx.fillStyle = map[cell];
+      ctx.fillRect(originX + drawCol * px, originY + rowIdx * px, px, px);
+    });
+  });
+
+  ctx.fillStyle = "#3a2820";
+  ctx.fillRect(Math.floor(entity.x - 3), Math.floor(entity.y + entity.radius - 2), 6, 3);
+
+  const w = entity.radius * 2;
+  const hpRatio = clampUnit(entity.hp / (entity.maxHp || 100), 0, 1);
+  ctx.fillStyle = "#101317";
+  ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w, 4);
+  ctx.fillStyle = "#b8f7b6";
+  ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w * hpRatio, 4);
+  drawEntityLabel(entity, "枭", "#b8f7b6");
+}
+
+/** 狱卒 / 精英 / Boss */
+function drawEnemySprite(entity, dir = 1) {
+  if (entity.kind === "shade") {
+    ctx.globalAlpha = 0.72;
+    drawPixelSprite(entity, { outline: "#1a1420", skin: "#6a5a7a", eye: "#cc88ff", cloth: "#3a2848", trim: "#8866aa", hp: "#aa88cc" }, dir);
+    ctx.globalAlpha = 1;
+    drawEntityLabel(entity, "影", "#aa88cc");
+    return;
+  }
+  const isBoss = entity.kind === "boss";
+  const isElite = entity.kind === "elite";
+  const px = isBoss ? 5 : 4;
+  const originX = Math.floor(entity.x - (isBoss ? 7 : 6) * px);
+  const originY = Math.floor(entity.y - (isBoss ? 9 : 8) * px);
+  const rows = isBoss
+    ? [
+        "0011111100",
+        "0116666610",
+        "0167777610",
+        "0167777610",
+        "0016776100",
+        "0018881000",
+        "0188888100",
+        "0185858100",
+        "0018181000",
+      ]
+    : [
+        "0011111000",
+        "0116666100",
+        "0167776100",
+        "0167776100",
+        "0016771000",
+        "0018881000",
+        "0188881000",
+        "0018181000",
+      ];
+  const map = {
+    "1": "#2a1010",
+    "6": "#c48878",
+    "7": "#ff5544",
+    "8": "#7a2a22",
+    "5": "#a03028",
+  };
+
+  rows.forEach((row, rowIdx) => {
+    [...row].forEach((cell, colIdx) => {
+      if (cell === "0") return;
+      const drawCol = dir > 0 ? colIdx : row.length - colIdx - 1;
+      ctx.fillStyle = map[cell];
+      ctx.fillRect(originX + drawCol * px, originY + rowIdx * px, px, px);
+    });
+  });
+
+  const w = entity.radius * 2;
+  const hpRatio = clampUnit(entity.hp / (entity.maxHp || 100), 0, 1);
+  ctx.fillStyle = "#101317";
+  ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w, 4);
+  ctx.fillStyle = isBoss ? "#ffd7d2" : isElite ? "#ffcc88" : "#ffd7a3";
+  ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w * hpRatio, 4);
+  if (isBoss) drawEntityLabel(entity, entity.bossName?.slice(0, 4) || "BOSS", "#ffaa88");
+  else if (isElite) drawEntityLabel(entity, "精英", "#ffcc88");
 }
 
 function drawPixelSprite(entity, palette, dir = 1) {
@@ -1202,18 +1869,6 @@ function drawPixelSprite(entity, palette, dir = 1) {
   ];
   const rows = [...head, ...body];
   const map = { "1": palette.outline, "2": palette.skin, "3": palette.eye, "4": palette.cloth, "5": palette.trim };
-
-  // 先画一个高可见底座，避免深色关卡里角色不可辨认
-  ctx.beginPath();
-  ctx.fillStyle = palette.base || "rgba(245, 220, 200, 0.28)";
-  ctx.arc(entity.x, entity.y, entity.radius + 2, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.strokeStyle = palette.baseStroke || "rgba(255, 230, 200, 0.45)";
-  ctx.lineWidth = 1.5;
-  ctx.arc(entity.x, entity.y, entity.radius + 2, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.lineWidth = 1;
 
   rows.forEach((row, rowIdx) => {
     [...row].forEach((cell, colIdx) => {
@@ -1344,32 +1999,140 @@ function drawOverlay() {
 function render(dt) {
   ctx.save();
   window.GameFx.applyShake(ctx);
+  const slide = state.renderSlide * canvas.width * 0.32;
+  ctx.translate(-slide, 0);
   drawBackground(dt);
   drawObstacles();
+  drawWestSeal();
+  drawRoomExit();
+  window.GameBossPatterns?.drawHazards(ctx, state.hazards);
   drawPixelSprite(state.player, { outline: "#1f2f39", skin: "#e1bfa1", eye: "#6ec4ff", cloth: "#3f86c2", trim: "#9fe4ff", hp: "#8dd0ff" }, 1);
-  drawPixelSprite(state.ally, { outline: "#2f1d14", skin: "#d7b399", eye: "#ffb77f", cloth: "#6e3d2a", trim: "#d08c55", base: "rgba(255, 188, 132, 0.30)", baseStroke: "rgba(255, 202, 160, 0.60)", hp: "#b8f7b6" }, 1);
+  drawEntityLabel(state.player, "魂", "#8dd0ff");
+  drawAllySprite(state.ally, state.ally.x < state.player.x ? -1 : 1);
   state.enemies.forEach((enemy) => {
-    drawPixelSprite(
-      enemy,
-      enemy.kind === "boss"
-        ? { outline: "#320d0d", skin: "#d7a299", eye: "#ffd1d1", cloth: "#a72f2f", trim: "#ff7d62", base: "rgba(255, 110, 94, 0.32)", baseStroke: "rgba(255, 138, 116, 0.60)", hp: "#ffd7d2" }
-        : { outline: "#321a13", skin: "#c79f86", eye: "#ffcc9c", cloth: "#8f4c35", trim: "#d98b5a", base: "rgba(240, 148, 112, 0.26)", baseStroke: "rgba(255, 178, 140, 0.5)", hp: "#ffd7a3" },
-      enemy.x < state.player.x ? -1 : 1,
-    );
+    drawEnemySprite(enemy, enemy.x < state.player.x ? -1 : 1);
   });
   drawBullets();
   drawCombatFx();
+  window.GameEnemyAI?.drawFx(ctx, state);
   window.GameFx.draw(ctx);
   drawAllyBubble();
   drawOverlay();
   ctx.restore();
+  if (state.floorState === "door_transition") {
+    window.GameDoorTransition.draw(ctx, canvas.width, canvas.height);
+  }
+  window.GameMinimap?.draw(ctx, state.dungeon, state.roomIndex, canvas.width);
+}
+
+function formatBlessingList(ids, faction) {
+  const names = window.GameBlessings?.namesTaken(ids, faction) || [];
+  return names.length
+    ? `<span class="stat-blessing-list">${names.join("、")}</span>`
+    : "无";
+}
+
+function updateStatsPanels() {
+  const p = state.player;
+  const a = state.ally;
+  const cfg = allyConfig();
+  const gb = window.GameBlessings;
+
+  if (playerStatsPanel) {
+    const dmg = Math.round(PLAYER_BASE_DAMAGE * (state.playerDamageMul || 1));
+    const dashCd = (PLAYER_BASE_DASH_CD * (state.dashCdMul || 1)).toFixed(2);
+    const spdPct = Math.round((p.speed / PLAYER_BASE_SPEED - 1) * 100);
+    const spdNote = spdPct > 0 ? ` (+${spdPct}%)` : "";
+    let shieldLine = "无";
+    if (p.shieldCd > 0) {
+      shieldLine = `<span class="stat-highlight">护盾 ${p.shieldCd.toFixed(1)}s</span>`;
+    }
+    let dashLine = `Shift · CD ${dashCd}s`;
+    if (p.dashInvuln > 0) {
+      dashLine += ` <span class="stat-highlight">无敌 ${p.dashInvuln.toFixed(2)}s</span>`;
+    } else if (p.dashCd > 0) {
+      dashLine += ` (剩 ${p.dashCd.toFixed(1)}s)`;
+    }
+
+    playerStatsPanel.innerHTML = `
+      <div class="stat-panel-title">魂体 · 阳差</div>
+      <dl>
+        <dt>HP</dt><dd>${Math.floor(p.hp)} / ${Math.floor(p.maxHp)}</dd>
+        <dt>移速</dt><dd>${Math.round(p.speed)}${spdNote}</dd>
+        <dt>攻击力</dt><dd>${dmg}</dd>
+        <dt>攻速</dt><dd>0.30s</dd>
+        <dt>闪避</dt><dd>${dashLine}</dd>
+        <dt>护盾</dt><dd>${shieldLine}</dd>
+        <dt>魂体印</dt><dd>${formatBlessingList(state.blessingsTaken, "soul")}</dd>
+      </dl>`;
+  }
+
+  if (allyStatsPanel) {
+    const stanceLabel = STANCE_LABELS[a.stance] || a.stance;
+    const alive = a.dead || a.hp <= 0 ? "阵亡" : "存活";
+    const speedEff = Math.round(a.speed * cfg.speedMul);
+    const range = a.stance === "assault" ? cfg.attackRange : "—";
+    let phase = "—";
+    if (a.stance === "assault") {
+      phase = a.combatPhase === "combat" ? "战斗·RL" : "接近·A*";
+    }
+    let focusLine = "无";
+    if (allyFocusActive()) {
+      const left = Math.max(0, a.focusUntil - performance.now() / 1000);
+      focusLine = `<span class="stat-highlight">残血 ${left.toFixed(1)}s</span>`;
+    }
+
+    allyStatsPanel.innerHTML = `
+      <div class="stat-panel-title">鬼差 · 乌枭</div>
+      <dl>
+        <dt>HP</dt><dd>${Math.floor(Math.max(0, a.hp))} / ${Math.floor(a.maxHp)}（${alive}）</dd>
+        <dt>姿态</dt><dd>${stanceLabel}${phase !== "—" ? ` · ${phase}` : ""}</dd>
+        <dt>移速</dt><dd>${Math.round(a.speed)} → ${speedEff}</dd>
+        <dt>攻击力</dt><dd>${cfg.damage}</dd>
+        <dt>攻速</dt><dd>${cfg.interval}s</dd>
+        <dt>射程</dt><dd>${range}</dd>
+        <dt>战术</dt><dd>${focusLine}</dd>
+        <dt>鬼差印</dt><dd>${formatBlessingList(state.blessingsTaken, "ally")}</dd>
+      </dl>`;
+  }
+
+  if (pactStatsPanel) {
+    const pactBlessings = gb?.listTaken(state.blessingsTaken, "pact") || [];
+    if (pactBlessings.length === 0) {
+      pactStatsPanel.classList.add("hidden");
+    } else {
+      pactStatsPanel.classList.remove("hidden");
+      const guardPct = Math.round((state.guardDamageReduction || 0.15) * 100);
+      const shieldDur = (2.2 * (state.blessingShieldMul || 1)).toFixed(1);
+      const lines = pactBlessings.map((b) => {
+        if (b.id === "ally_guard") {
+          return `黑签护幕：守护贴身减伤 ${guardPct}%`;
+        }
+        if (b.id === "iron_veil") {
+          return `铁幕印：救援护盾 ${shieldDur}s`;
+        }
+        if (b.id === "slayer_vitae") {
+          const stacks = gb.stackCount(state, "slayer_vitae");
+          const pct = stacks * (gb.KILL_HEAL_PCT_PER_STACK * 100);
+          const example = gb.killHealAmount(state, state.player);
+          return `噬敌生息：击杀回血 ${pct}% 最大生命（约 ${example}）`;
+        }
+        return b.name;
+      });
+      pactStatsPanel.innerHTML = `
+        <div class="stat-panel-title">契约律令</div>
+        <dl>
+          <dt>联动</dt><dd>${lines.join("<br>")}</dd>
+          <dt>契约印</dt><dd>${formatBlessingList(state.blessingsTaken, "pact")}</dd>
+        </dl>`;
+    }
+  }
 }
 
 function updateHud() {
   const stanceLabel = STANCE_LABELS[state.ally.stance] || state.ally.stance;
   const floorName = FLOOR_META[(state.floor - 1) % FLOOR_META.length].name;
 
-  // assault 姿态时显示 FSM 阶段 + RL 模型加载状态
   let rlTag = "";
   if (state.ally.stance === "assault") {
     if (state.ally.combatPhase === "combat") {
@@ -1386,10 +2149,25 @@ function updateHud() {
   }
 
   const comboTag = state.combo > 1 ? ` | 连击 ${state.combo}` : "";
+  const room = currentRoom();
+  const scale = state._combatScale;
+  const scaleTag = scale
+    ? ` | 敌强×${scale.hpMul.toFixed(2)}`
+    : "";
+  const roomTag = room && state.dungeon
+    ? ` | ${room.label} ${state.roomIndex + 1}/${state.dungeon.rooms.length}`
+    : "";
+  let doorTag = "";
+  if (room && state.dungeon && !room.boss && room.index < state.dungeon.rooms.length - 1) {
+    if (state.roomCleared) doorTag = " | 门已开";
+    else if (state.enemies.length > 0) doorTag = ` | 剩余 ${state.enemies.length} 敌`;
+    else doorTag = " | 门未开";
+  }
   hudStats.textContent =
-    `${floorName}（第 ${state.floor} 层） | 玩家 HP ${Math.floor(state.player.hp)}/${state.player.maxHp}`
+    `${floorName}（第 ${state.floor} 层）${roomTag} | 玩家 HP ${Math.floor(state.player.hp)}/${state.player.maxHp}`
     + ` | 乌枭 HP ${Math.floor(state.ally.hp)}/${state.ally.maxHp}`
-    + ` | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}${comboTag}`;
+    + ` | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}${doorTag}${scaleTag}${comboTag}`;
+  updateStatsPanels();
 }
 
 // ── NPC 对话与自主思考 ────────────────────────────────────────────────────────
@@ -1401,12 +2179,14 @@ const STANCE_LABELS = { assault: "突击", guard: "守护" };
 
 const NPC_AUTONOMY = {
   enabled: true,
-  idleThresholdMs: 8000,
-  thinkIntervalMs: 12000,
-  speechCooldownMs: 15000,
-  socialBeatMs: 45000,
-  periodicFallbackMs: 75000,
-  playerIdleForHelpMs: 8000,
+  idleThresholdMs: 5000,
+  thinkIntervalMs: 8000,
+  speechCooldownMs: 12000,
+  criticalSpeechCooldownMs: 18000,
+  criticalThinkIntervalMs: 14000,
+  socialBeatMs: 38000,
+  periodicFallbackMs: 60000,
+  playerIdleForHelpMs: 6000,
   allyCriticalPct: 0.25,
   playerDangerPct: 0.30,
 };
@@ -1432,6 +2212,37 @@ const npcIO = {
   consecutiveNoop: 0,
   skipLogAt: 0,
   events: [],
+  blessingJustPicked: null,
+};
+
+const NPC_EVENT_TTL_MS = {
+  room_cleared: 4000,
+  room_enter: 10000,
+  floor_enter: 12000,
+  blessing_picked: 6000,
+  boss_spawn: 8000,
+  kill: 3500,
+  hp_drop: 4500,
+  default: 12000,
+};
+
+const NPC_SCENE_EVENT_KINDS = new Set([
+  "room_cleared", "room_enter", "floor_enter", "blessing_picked", "boss_spawn",
+]);
+
+const NPC_CONSUME_EVENTS = {
+  room_cleared: ["room_cleared"],
+  floor_enter: ["floor_enter"],
+  floor_react: ["floor_enter"],
+  opening: ["floor_enter"],
+  room_enter_elite: ["room_enter"],
+  blessing_picked: ["blessing_picked"],
+  boss_spawn: ["boss_spawn"],
+  boss_enrage: ["boss_enrage"],
+  enemy_surge: ["kill"],
+  enemy_thin: ["kill"],
+  floor_clear: ["floor_clear", "kill"],
+  enemy_clear: ["kill", "floor_clear"],
 };
 
 function npcPushEvent(kind, data = {}) {
@@ -1439,11 +2250,115 @@ function npcPushEvent(kind, data = {}) {
   if (npcIO.events.length > 12) npcIO.events.shift();
 }
 
-function npcRecentEventKinds(maxAgeMs = 12000) {
+function npcPurgeEvents(...kinds) {
+  if (!kinds.length) return;
+  const drop = new Set(kinds);
+  npcIO.events = npcIO.events.filter((e) => !drop.has(e.kind));
+}
+
+function npcRecentEventKinds(maxAgeMs) {
   const now = performance.now();
-  return npcIO.events
-    .filter((e) => now - e.at < maxAgeMs)
-    .map((e) => e.kind);
+  const active = npcIO.events.filter((e) => {
+    const ttl = NPC_EVENT_TTL_MS[e.kind] ?? NPC_EVENT_TTL_MS.default;
+    const ageLimit = maxAgeMs != null ? Math.min(maxAgeMs, ttl) : ttl;
+    return now - e.at < ageLimit;
+  });
+  const kinds = [];
+  let newestScene = null;
+  for (let i = active.length - 1; i >= 0; i -= 1) {
+    if (NPC_SCENE_EVENT_KINDS.has(active[i].kind)) {
+      newestScene = active[i].kind;
+      break;
+    }
+  }
+  if (newestScene) kinds.push(newestScene);
+  active.forEach((e) => {
+    if (!NPC_SCENE_EVENT_KINDS.has(e.kind) && !kinds.includes(e.kind)) kinds.push(e.kind);
+  });
+  return kinds.slice(0, 6);
+}
+
+function npcSceneEpoch() {
+  return `${state.floor}:${state.roomIndex}:${state.floorState}`;
+}
+
+function npcThinkContextKey() {
+  return [
+    state.floor,
+    state.roomIndex,
+    state.floorState,
+    state.roomCleared ? 1 : 0,
+    state.enemies.length,
+    state.ally.stance,
+    Math.floor(state.player.hp / 25),
+    Math.floor(state.ally.hp / 25),
+  ].join(":");
+}
+
+function npcLocalCombatMood() {
+  const playerPct = state.player.hp / state.player.maxHp;
+  const allyPct = state.ally.hp / Math.max(1, state.ally.maxHp);
+  if (allyPct <= 0.25 || playerPct <= 0.30) return "critical";
+  if (state.enemies.length > 0) return "engaged";
+  if (state.roomCleared && state.enemies.length === 0 && state.floorState === "playing") {
+    return "relieved";
+  }
+  return npcIO.combatMood || "observing";
+}
+
+function npcIntentStillValid(reason, intent) {
+  const tag = intent || reason || "";
+  if (!tag) return true;
+  const scene = buildSceneInfo("autonomous");
+  const tac = npcBuildTacticalContext();
+
+  switch (tag) {
+    case "room_cleared":
+      return scene.room_cleared && scene.door_open
+        && state.enemies.length === 0 && state.floorState === "playing";
+    case "floor_enter":
+    case "floor_react":
+    case "opening":
+      return state.floorState === "playing" && state.enemies.length > 0;
+    case "room_enter_elite":
+      return scene.room_type === "elite" && state.enemies.length > 0;
+    case "blessing_picked":
+      return state.floorState === "blessing_pick" || !!npcIO.blessingJustPicked;
+    case "boss_spawn":
+      return scene.boss_alive || state.enemies.some((e) => e.kind === "boss");
+    case "boss_enrage":
+      return state.enemies.some((e) => e.kind === "boss" && e.phase >= 2);
+    case "hazard_dodge":
+    case "hazard_near_player":
+      return tac.hazard_near_player;
+    case "dodge_bullets":
+    case "incoming_bullets":
+      return tac.incoming_bullets_player >= 2 || tac.incoming_bullets_ally >= 2;
+    case "under_fire":
+    case "player_under_fire":
+      return tac.player_under_fire;
+    case "los_blocked":
+      return tac.los_blocked && tac.nearest_enemy_distance >= 0 && tac.nearest_enemy_distance < 250;
+    case "ally_nav_stuck":
+      return tac.ally_nav_stuck;
+    case "player_silenced":
+      return state.player.silenceT > 0;
+    case "enemy_surge":
+      return state.enemies.length >= 3;
+    case "enemy_thin":
+    case "enemy_delta":
+      return state.enemies.length <= 2;
+    case "enemy_clear":
+    case "floor_clear":
+      return state.enemies.length === 0 && scene.room_cleared;
+    default:
+      return true;
+  }
+}
+
+function npcConsumeEventsForSpeech(reason, intent) {
+  const kinds = NPC_CONSUME_EVENTS[intent] || NPC_CONSUME_EVENTS[reason];
+  if (kinds?.length) npcPurgeEvents(...kinds);
 }
 
 function npcMarkPlayerAction() {
@@ -1452,7 +2367,8 @@ function npcMarkPlayerAction() {
 
 function npcSceneHash() {
   const s = buildSceneInfo("autonomous");
-  return `${s.floor}|${s.player_hp}|${s.ally_hp}|${s.enemy_count}|${s.ally_stance}|${s.floor_state}|${s.boss_alive}`;
+  return `${s.floor}|${s.room_index}|${s.door_open}|${s.player_hp}|${s.ally_hp}|`
+    + `${s.enemy_count}|${s.ally_stance}|${s.floor_state}|${s.boss_alive}|${s.blessings_total}`;
 }
 
 function npcSinceLastSpeechS(now = performance.now()) {
@@ -1545,6 +2461,36 @@ function npcSkipLog(reason) {
   console.info("[NPC] think skipped:", reason);
 }
 
+function npcEnemyBreakdown() {
+  const out = { mob: 0, elite: 0, boss: 0, shade: 0 };
+  state.enemies.forEach((e) => {
+    if (e.kind === "elite") out.elite += 1;
+    else if (e.kind === "boss") out.boss += 1;
+    else if (e.kind === "shade") out.shade += 1;
+    else out.mob += 1;
+  });
+  return out;
+}
+
+function npcHazardContext() {
+  const p = state.player;
+  const hazards = state.hazards || [];
+  let nearPlayer = false;
+  let nearAlly = false;
+  for (const h of hazards) {
+    if (h.warnT > 0 || !(window.GameHazards?.isActive(h))) continue;
+    if (Math.hypot(p.x - h.x, p.y - h.y) < h.r + p.radius) nearPlayer = true;
+    if (state.ally.hp > 0 && Math.hypot(state.ally.x - h.x, state.ally.y - h.y) < h.r + state.ally.radius) {
+      nearAlly = true;
+    }
+  }
+  return {
+    hazard_count: hazards.length,
+    hazard_near_player: nearPlayer,
+    hazard_near_ally: nearAlly,
+  };
+}
+
 function buildSceneInfo(trigger = "reactive") {
   const playerHp = Math.floor(state.player.hp);
   const allyHp = Math.floor(state.ally.hp);
@@ -1556,10 +2502,34 @@ function buildSceneInfo(trigger = "reactive") {
   const allyNearPlayer = allyPlayerDist <= 80;
   const allyGuardingPlayer = state.ally.stance === "guard" && allyNearPlayer;
   const tactical = npcBuildTacticalContext();
-  return {
-    mode: "battle",
+  const room = currentRoom();
+  const floorMeta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
+  const breakdown = npcEnemyBreakdown();
+  const [nearestEnemy] = findNearestEnemy(state.player);
+  const boss = state.enemies.find((e) => e.kind === "boss");
+  const elite = state.enemies.find((e) => e.kind === "elite");
+  const blessSum = window.GameBlessings?.summarizeForNpc(state) || { total: 0, soul: [], ally: [], pact: [], tags: [] };
+  const canSpeak = state.floorState !== "blessing_pick" && state.floorState !== "door_transition";
+  const doorAvailable = !!(room && state.dungeon && !room.boss && room.index < state.dungeon.rooms.length - 1);
+  const doorOpen = !!(doorAvailable && state.roomCleared && state.enemies.length === 0);
+  const hazardCtx = npcHazardContext();
+
+  const scene = {
+    mode: state.floorState === "blessing_pick" ? "blessing_pick" : "dungeon",
+    can_autonomy_speak: canSpeak,
     floor: state.floor,
+    floor_name: floorMeta.name,
+    floor_hint_short: (floorMeta.hint || "").slice(0, 48),
     floor_state: state.floorState,
+    room_index: state.roomIndex,
+    room_label: room?.label || "",
+    room_type: room?.type || "",
+    dungeon_progress: room && state.dungeon
+      ? `${state.roomIndex + 1}/${state.dungeon.rooms.length}`
+      : "",
+    room_cleared: !!state.roomCleared,
+    door_available: doorAvailable,
+    door_open: doorOpen,
     ally_stance: state.ally.stance,
     ally_combat_phase: state.ally.combatPhase,
     ally_player_distance: allyPlayerDist,
@@ -1568,12 +2538,29 @@ function buildSceneInfo(trigger = "reactive") {
     player_hp: playerHp,
     player_hp_pct: playerHpPct,
     player_max_hp: state.player.maxHp,
+    player_silenced: state.player.silenceT > 0,
+    player_pulled: state.player.pullT > 0,
     ally_hp: allyHp,
     ally_hp_pct: allyHpPct,
     ally_max_hp: state.ally.maxHp,
+    ally_down: allyIsDown(),
     enemy_count: state.enemies.length,
+    enemy_breakdown: breakdown,
+    nearest_enemy_kind: nearestEnemy?.kind || "",
     prev_enemy_count: npcIO.prevEnemyCount,
     boss_alive: state.bossAlive,
+    boss_name: boss?.bossName || "",
+    boss_ult: boss?.ultName || "",
+    boss_skill_name: boss?.skillName || "",
+    elite_present: breakdown.elite > 0,
+    elite_name: elite?.eliteName || "",
+    elite_id: elite?.eliteId || "",
+    blessings_total: blessSum.total,
+    blessings_summary: blessSum,
+    build_tags: blessSum.tags,
+    combat_threat_mul: state._combatScale?.hpMul ?? 1,
+    ally_can_dodge_hazards: true,
+    screen_fog: (state.screenFogT || 0) > 0,
     player_last_action_s: playerActionS,
     player_is_active: playerActionS < 6,
     player_is_idle: playerActionS >= NPC_AUTONOMY.playerIdleForHelpMs / 1000,
@@ -1584,10 +2571,16 @@ function buildSceneInfo(trigger = "reactive") {
     player_in_danger: playerHpPct <= NPC_AUTONOMY.playerDangerPct,
     recent_events: npcRecentEventKinds(),
     trigger,
-    idle_seconds: trigger === "autonomous" ? (now - npcIO.lastPlayerMsgAt) / 1000 : 0,
+    combat_mood: npcLocalCombatMood(),
+    idle_seconds: (now - npcIO.lastPlayerMsgAt) / 1000,
     since_last_npc_speech: npcSinceLastSpeechS(now),
+    ...hazardCtx,
     ...tactical,
   };
+  if (npcIO.blessingJustPicked) {
+    scene.blessing_just_picked = { ...npcIO.blessingJustPicked };
+  }
+  return scene;
 }
 
 function npcStartRequest(mode, priority = 99) {
@@ -1616,7 +2609,8 @@ function npcMarkSpeech() {
 
 function applyStance(stance, reply, opts = {}) {
   if (!stance) return;
-  if (stance === "assault" && state.ally.dead) return;
+  syncAllyLifeState({ announce: false });
+  if (stance === "assault" && allyIsDown()) return;
   const stanceChanged = opts.stanceChanged !== undefined
     ? opts.stanceChanged
     : state.ally.stance !== stance;
@@ -1639,6 +2633,15 @@ function applyStance(stance, reply, opts = {}) {
   }
 }
 
+function npcThinkResponseFresh(ctx, intentHint = "") {
+  if (!ctx || ctx.source !== "autonomous") return true;
+  if (ctx.contextKey !== npcThinkContextKey()) return false;
+  if (ctx.sceneEpoch !== npcSceneEpoch()) return false;
+  const tag = intentHint || ctx.intent || ctx.reason || "";
+  if (tag && !npcIntentStillValid(ctx.reason, tag)) return false;
+  return true;
+}
+
 async function consumeNpcStream(body, opts = {}) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -1647,6 +2650,19 @@ async function consumeNpcStream(body, opts = {}) {
   let buffer = "";
   let bubbleThrottle = 0;
   let outcome = "unknown";
+  let droppedStale = false;
+  let lastIntent = opts.intent || "";
+
+  const showAutonomous = (fn, intentHint = "") => {
+    const tag = intentHint || lastIntent;
+    if (!npcThinkResponseFresh(opts, tag)) {
+      droppedStale = true;
+      return false;
+    }
+    fn();
+    if (opts.source === "autonomous" && tag) npcConsumeEventsForSpeech(opts.reason, tag);
+    return true;
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -1671,12 +2687,19 @@ async function consumeNpcStream(body, opts = {}) {
         continue;
       }
       if (evt.type === "command") {
+        if (evt.intent) lastIntent = evt.intent;
         outcome = `command:${evt.stance}:${evt.reply || ""}`;
-        applyStance(evt.stance, evt.reply, {
-          autonomous: opts.source === "autonomous",
-          stanceChanged: evt.stance_changed !== false,
-        });
+        showAutonomous(() => {
+          applyStance(evt.stance, evt.reply, {
+            autonomous: opts.source === "autonomous",
+            stanceChanged: evt.stance_changed !== false,
+          });
+        }, evt.intent);
       } else if (evt.type === "delta") {
+        if (!npcThinkResponseFresh(opts, lastIntent)) {
+          droppedStale = true;
+          continue;
+        }
         outcome = "dialogue(streaming)";
         if (!msgNode) msgNode = appendStreamingNpcMessage();
         accumulated += evt.text;
@@ -1684,18 +2707,26 @@ async function consumeNpcStream(body, opts = {}) {
         const now = Date.now();
         if (now - bubbleThrottle > 100) { setAllyBubble(accumulated); bubbleThrottle = now; }
       } else if (evt.type === "done") {
+        if (evt.intent) lastIntent = evt.intent;
         const finalText = evt.action?.dialogue || accumulated || "收到，我会继续和你协同。";
         const emotion = evt.action?.emotion || "neutral";
         outcome = `dialogue:${finalText}`;
-        if (msgNode) msgNode.finish(finalText, emotion);
-        else appendMessage("npc", finalText);
-        setAllyBubble(`${emotionKaomoji(emotion)} ${finalText}`);
-        npcMarkSpeech();
+        showAutonomous(() => {
+          if (msgNode) msgNode.finish(finalText, emotion);
+          else appendMessage("npc", finalText);
+          setAllyBubble(`${emotionKaomoji(emotion)} ${finalText}`);
+          npcMarkSpeech();
+        }, evt.intent);
+      } else if (evt.type === "typing") {
+        if (!msgNode && opts.source !== "autonomous") setAllyBubble("…");
       } else if (evt.type === "polish") {
+        if (opts.source === "autonomous") continue;
         const polished = evt.dialogue || "";
         if (polished) {
           outcome = `polish:${polished}`;
-          setAllyBubble(`${emotionKaomoji(evt.emotion || "focused")} ${polished}`);
+          const emo = evt.emotion || "focused";
+          setAllyBubble(`${emotionKaomoji(emo)} ${polished}`);
+          if (msgNode) msgNode.finish(polished, emo);
         }
       } else if (evt.type === "error") {
         const fallbackText = evt.fallback?.dialogue || "连接中断。我会继续执行上一条指令。";
@@ -1709,27 +2740,56 @@ async function consumeNpcStream(body, opts = {}) {
   }
 
   if (opts.source === "autonomous") {
-    if (outcome === "noop") npcIO.consecutiveNoop += 1;
+    if (droppedStale) {
+      outcome = "stale_dropped";
+      console.info(
+        "[NPC] think response dropped (stale):",
+        opts.contextKey, "→", npcThinkContextKey(),
+        opts.reason || opts.intent || "",
+      );
+    } else if (outcome === "noop") npcIO.consecutiveNoop += 1;
     else npcIO.consecutiveNoop = 0;
-    console.info("[NPC] think response:", outcome);
+    if (!droppedStale) console.info("[NPC] think response:", outcome);
   }
   return outcome;
 }
 
 function npcNoopBackoffMs() {
-  const steps = [15000, 30000, 60000];
+  const steps = [12000, 24000, 48000];
   const idx = Math.min(Math.max(0, npcIO.consecutiveNoop - 2), steps.length - 1);
   return npcIO.consecutiveNoop >= 2 ? steps[idx] : 0;
 }
 
+function npcCriticalThrottled(now = performance.now()) {
+  if (npcIO.lastNpcSpeechAt > 0
+      && now - npcIO.lastNpcSpeechAt < NPC_AUTONOMY.criticalSpeechCooldownMs) {
+    return true;
+  }
+  if (npcIO.lastThinkCompletedAt > 0
+      && now - npcIO.lastThinkCompletedAt < NPC_AUTONOMY.criticalThinkIntervalMs) {
+    return true;
+  }
+  return false;
+}
+
 function npcEvaluateTriggers() {
   if (!NPC_AUTONOMY.enabled) return null;
-  if (state.result || state.ally.dead) return null;
+  if (state.result || allyIsDown()) return null;
+  if (state.floorState === "blessing_pick" || state.floorState === "door_transition") return null;
 
   const now = performance.now();
   const scene = buildSceneInfo("autonomous");
   const hash = npcSceneHash();
   const events = npcRecentEventKinds();
+
+  if (events.includes("blessing_picked") && npcIO.blessingJustPicked) {
+    return {
+      priority: 1,
+      trigger: "scene_change",
+      reason: "blessing_picked",
+      scene_change_kind: "blessing_picked",
+    };
+  }
 
   if (events.includes("floor_clear") && state.floorState === "clear") {
     return {
@@ -1758,17 +2818,19 @@ function npcEvaluateTriggers() {
     };
   }
 
-  if (scene.ally_hp_pct <= 0.10) {
-    return { priority: 0, trigger: "critical", reason: "ally_dire" };
-  }
-  if (scene.ally_in_danger) {
-    return { priority: 0, trigger: "critical", reason: "ally_critical" };
-  }
-  if (scene.player_in_danger && scene.ally_stance === "assault") {
-    return { priority: 0, trigger: "critical", reason: "player_danger_assault" };
-  }
-  if (scene.player_in_danger && scene.player_is_idle) {
-    return { priority: 0, trigger: "critical", reason: "player_idle_danger" };
+  if (!npcCriticalThrottled(now)) {
+    if (scene.ally_hp_pct <= 0.10) {
+      return { priority: 0, trigger: "critical", reason: "ally_dire" };
+    }
+    if (scene.ally_in_danger) {
+      return { priority: 0, trigger: "critical", reason: "ally_critical" };
+    }
+    if (scene.player_in_danger && scene.ally_stance === "assault") {
+      return { priority: 0, trigger: "critical", reason: "player_danger_assault" };
+    }
+    if (scene.player_in_danger && scene.player_is_idle) {
+      return { priority: 0, trigger: "critical", reason: "player_idle_danger" };
+    }
   }
 
   if (events.includes("floor_enter") || hash !== npcIO.lastSceneHash) {
@@ -1793,12 +2855,11 @@ function npcEvaluateTriggers() {
 
   if (now - npcIO.lastPlayerMsgAt < NPC_AUTONOMY.idleThresholdMs) return null;
 
-  if (npcIO.lastThinkCompletedAt && now - npcIO.lastThinkCompletedAt < NPC_AUTONOMY.thinkIntervalMs) {
-    return null;
-  }
-  const backoff = npcNoopBackoffMs();
-  if (backoff && npcIO.lastThinkCompletedAt && now - npcIO.lastThinkCompletedAt < backoff) {
-    return null;
+  if (npcIO.lastThinkCompletedAt) {
+    const elapsed = now - npcIO.lastThinkCompletedAt;
+    if (elapsed < NPC_AUTONOMY.thinkIntervalMs) return null;
+    const backoff = npcNoopBackoffMs();
+    if (backoff && elapsed < backoff) return null;
   }
   if (!npcIO.lastThinkCompletedAt
       || now - npcIO.lastThinkCompletedAt >= NPC_AUTONOMY.periodicFallbackMs) {
@@ -1815,6 +2876,8 @@ function npcEnqueueThink(evaluation) {
   }
 
   const ctrl = npcStartRequest("think", evaluation.priority);
+  const sceneEpoch = npcSceneEpoch();
+  const contextKey = npcThinkContextKey();
   const scene = buildSceneInfo("autonomous");
   scene.scene_hash = npcSceneHash();
   scene.scene_change_kind = evaluation.scene_change_kind || "";
@@ -1837,7 +2900,13 @@ function npcEnqueueThink(evaluation) {
   })
     .then((resp) => {
       if (!resp.ok || !resp.body) throw new Error(`think failed: HTTP ${resp.status}`);
-      return consumeNpcStream(resp.body, { source: "autonomous" });
+      return consumeNpcStream(resp.body, {
+        source: "autonomous",
+        sceneEpoch,
+        contextKey,
+        trigger: evaluation.trigger,
+        reason: evaluation.reason,
+      });
     })
     .catch((err) => {
       if (err.name === "AbortError") return;
@@ -1845,19 +2914,22 @@ function npcEnqueueThink(evaluation) {
     })
     .finally(() => {
       npcIO.lastThinkCompletedAt = performance.now();
-      npcIO.prevEnemyCount = state.enemies.length;
       npcIO.lastSceneHash = npcSceneHash();
+      npcIO.blessingJustPicked = null;
       npcIO.currentPriority = 99;
       npcEndRequest("think");
     });
 }
 
 function npcTickAutonomy() {
-  if (state.floorState === "playing" && !state.result && !state.ally.dead) {
+  if (state.floorState === "playing" && !state.result && !allyIsDown()) {
     npcTrackHpEvents();
   }
   const evaluation = npcEvaluateTriggers();
   if (evaluation) npcEnqueueThink(evaluation);
+  if (state.floorState === "playing") {
+    npcIO.prevEnemyCount = state.enemies.length;
+  }
 }
 
 async function sendPlayerChat(message) {
@@ -1905,6 +2977,10 @@ function loop(ts) {
   updateBullets(dt);
   removeDeadEnemies();
   checkDefeat();
+  updateDoorTransition(dt);
+  window.GameEnemyAI?.updateStatusEffects(state, dt);
+  window.GameEnemyAI?.updateHazardDebuffs(state, dt);
+  window.GameBossPatterns?.updateHazards(state, dt);
   updateFloorTransition(dt);
   window.GameFx.update(dt);
   render(dt);
@@ -1938,6 +3014,7 @@ chatForm.addEventListener("submit", async (e) => {
 
 appendMessage("npc", "黑签鬼差乌枭到位。你别乱送，我就能把你带到无间边狱。");
 npcInitAutonomy();
-console.info(`[NPC] autonomy9 + game ${GAME_BUILD} (safe upgrades, RL frozen)`);
-setInterval(npcTickAutonomy, 1000);
+window.__npcPushEvent = npcPushEvent;
+console.info(`[NPC] ${NPC_AUTONOMY_BUILD} + game ${GAME_BUILD}`);
+setInterval(npcTickAutonomy, 800);
 requestAnimationFrame(loop);

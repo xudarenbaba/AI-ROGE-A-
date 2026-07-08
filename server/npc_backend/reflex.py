@@ -27,8 +27,14 @@ def reflex_decide(
     enemy_count = int(scene_info.get("enemy_count", 0))
     floor_state = str(scene_info.get("floor_state", "playing"))
 
-    if floor_state != "playing":
+    if floor_state != "playing" or not scene_info.get("can_autonomy_speak", True):
         return ReflexDecision(type="noop")
+
+    if scene_info.get("hazard_near_player"):
+        return ReflexDecision(
+            type="dialogue",
+            reply="圈要炸了，先出圈！",
+        )
 
     if ally_hp <= 0:
         if ally_stance == "assault":

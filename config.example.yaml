@@ -1,6 +1,7 @@
 llm:
   provider: openai_compatible
   model: deepseek-chat
+  decide_model: deepseek-chat
   api_key: "your api key here"
   base_url: https://api.deepseek.com
   temperature: 0.2
@@ -27,26 +28,28 @@ memory:
 npc_autonomy:
   enabled: true
   reflex_enabled: true
-  idle_threshold_s: 8
-  think_interval_s: 12
-  speech_cooldown_s: 15
-  critical_speech_cd_mul: 0.5
+  idle_threshold_s: 5
+  think_interval_s: 8
+  speech_cooldown_s: 12
+  scene_speech_cooldown_s: 4
+  critical_speech_cooldown_s: 6
+  critical_speech_cd_mul: 1.0
   stance_change_cooldown_s: 25
   intent_ttl_s: 30
-  noop_backoff_s: [15, 30, 60]
+  noop_backoff_s: [12, 24, 48]
   rule_noop_after: 2
   require_scene_change: true
-  stale_force_think_s: 75
+  stale_force_think_s: 55
   recent_lines_max: 8
   duplicate_similarity: 0.55
-  max_speech_per_minute: 4
+  max_speech_per_minute: 5
   triggers:
     ally_critical_hp_pct: 0.25
     ally_dire_hp_pct: 0.10
     player_danger_hp_pct: 0.30
-    player_idle_for_help_s: 8
-    social_beat_s: 45
-    periodic_fallback_s: 75
+    player_idle_for_help_s: 6
+    social_beat_s: 38
+    periodic_fallback_s: 60
     assault_guard_min_s: 10
     assault_player_active_s: 6
     assault_min_ally_hp_pct: 0.35

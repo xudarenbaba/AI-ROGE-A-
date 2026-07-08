@@ -39,10 +39,11 @@ def _client() -> OpenAI:
     )
 
 
-def chat_completion(messages: list[dict[str, str]]) -> str:
+def chat_completion(messages: list[dict[str, str]], *, model: str | None = None) -> str:
     cfg = load_config().get("llm", {})
+    use_model = model or cfg.get("model", "deepseek-chat")
     resp = _client().chat.completions.create(
-        model=cfg.get("model", "deepseek-chat"),
+        model=use_model,
         messages=messages,
         temperature=float(cfg.get("temperature", 0.3)),
         timeout=int(cfg.get("timeout_s", 60)),
@@ -106,8 +107,10 @@ def autonomous_decide(
         allowed_intents=allowed_intents,
         trigger=trigger or str(scene_info.get("trigger", "periodic")),
     )
+    cfg = load_config().get("llm", {})
+    decide_model = cfg.get("decide_model") or cfg.get("model", "deepseek-chat")
     try:
-        raw = chat_completion(messages)
+        raw = chat_completion(messages, model=decide_model)
         stripped = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data: dict[str, Any] = json.loads(stripped)
         decision_type = str(data.get("type", "")).strip()
@@ -128,6 +131,32 @@ def autonomous_decide(
     return {"type": "noop"}
 
 
+_GUARD_HINTS = ("守护我", "跟着我", "贴着我", "别乱跑", "回来", "护着我", "守住", "守护")
+_ASSAULT_HINTS = ("突击", "冲上去", "开路", "压制", "上去打", "前锋", "进攻", "去突击")
+
+
+def fast_command_intent(message: str) -> dict[str, Any] | None:
+    """短句战术指令快路径，跳过意图分类 LLM。"""
+    text = message.strip()
+    if not text or len(text) > 24:
+        return None
+    for hint in _GUARD_HINTS:
+        if hint in text:
+            return {
+                "type": "command",
+                "stance": "guard",
+                "reply": _STANCE_REPLIES["guard"],
+            }
+    for hint in _ASSAULT_HINTS:
+        if hint in text:
+            return {
+                "type": "command",
+                "stance": "assault",
+                "reply": _STANCE_REPLIES["assault"],
+            }
+    return None
+
+
 def classify_intent(
     *,
     message: str,
@@ -141,10 +170,12 @@ def classify_intent(
       - {"type": "dialogue"}
       - {"type": "command", "stance": "guard|assault|skirmish", "reply": "..."}
     """
-    user_prompt = (
-        f"npc_name={npc_name}\n"
-        f"scene_info={json.dumps(scene_info, ensure_ascii=False)}\n"
-        f"player_message={message}"
+    from server.npc_backend.prompts import build_intent_classify_prompt
+
+    user_prompt = build_intent_classify_prompt(
+        npc_name=npc_name,
+        message=message,
+        scene_info=scene_info,
     )
     try:
         raw = chat_completion([

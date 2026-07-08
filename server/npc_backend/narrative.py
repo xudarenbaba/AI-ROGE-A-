@@ -12,12 +12,16 @@ def scene_hash(scene_info: dict[str, Any]) -> str:
         str(scene_info.get(k, ""))
         for k in (
             "floor",
+            "room_index",
+            "room_type",
+            "door_open",
             "floor_state",
             "player_hp",
             "ally_hp",
             "enemy_count",
             "ally_stance",
             "boss_alive",
+            "blessings_total",
         )
     )
 
@@ -194,16 +198,25 @@ class NarrativeStore:
             return True
         return False
 
-    def can_speak(self, st: NarrativeState, *, priority: int) -> str | None:
+    def can_speak(
+        self,
+        st: NarrativeState,
+        *,
+        priority: int,
+        trigger: str = "",
+    ) -> str | None:
         now = time.time()
         max_per_min = int(self._cfg.get("max_speech_per_minute", 4))
         st.speech_timestamps = [t for t in st.speech_timestamps if now - t < 60]
-        if len(st.speech_timestamps) >= max_per_min and priority > 0:
+        if len(st.speech_timestamps) >= max_per_min:
             return "speech_rate_limit"
 
-        speech_cd = float(self._cfg.get("speech_cooldown_s", 15))
         if priority == 0:
-            speech_cd *= float(self._cfg.get("critical_speech_cd_mul", 0.5))
+            speech_cd = float(self._cfg.get("critical_speech_cooldown_s", 6))
+        elif priority == 1 and trigger in ("scene_change", "critical"):
+            speech_cd = float(self._cfg.get("scene_speech_cooldown_s", 4))
+        else:
+            speech_cd = float(self._cfg.get("speech_cooldown_s", 12))
         if st.last_speech_at and now - st.last_speech_at < speech_cd:
             return f"speech_cooldown({speech_cd}s)"
         return None
@@ -216,11 +229,11 @@ class NarrativeStore:
         priority: int = 3,
         now: float | None = None,
     ) -> str | None:
-        if priority <= 0:
-            return None
-
         now = now or time.time()
         autonomy = self._cfg
+
+        if priority <= 0:
+            return self.can_speak(st, priority=priority, trigger=trigger)
         trigger = str(scene_info.get("trigger", ""))
 
         if trigger in ("social", "periodic"):
@@ -229,7 +242,7 @@ class NarrativeStore:
             if since_speech >= social_s:
                 return None
 
-        rate_reason = self.can_speak(st, priority=priority)
+        rate_reason = self.can_speak(st, priority=priority, trigger=trigger)
         if rate_reason and priority >= 2 and trigger not in ("social", "periodic"):
             return rate_reason
 
@@ -251,7 +264,7 @@ class NarrativeStore:
                 return "scene_unchanged"
 
         if priority >= 2 and trigger not in ("social", "periodic"):
-            cd_reason = self.can_speak(st, priority=priority)
+            cd_reason = self.can_speak(st, priority=priority, trigger=trigger)
             if cd_reason:
                 return cd_reason
 

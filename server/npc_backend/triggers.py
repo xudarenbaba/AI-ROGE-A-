@@ -62,6 +62,14 @@ _TEMPLATES: dict[str, list[str]] = {
         "大家伙来了，别盯着小怪。",
         "Boss 现身了，注意走位。",
     ],
+    "boss_enrage": [
+        "它进二阶段了，技能会更密！",
+        "Boss 暴怒了，别贪刀。",
+    ],
+    "elite_enrage": [
+        "精英厉怒了，技能加快！",
+        "这精英半血了，当心连招。",
+    ],
     "banter": [
         "你别光看着，想好怎么打没？",
         "还行，继续，别掉链子。",
@@ -100,6 +108,27 @@ _TEMPLATES: dict[str, list[str]] = {
         "新一层开了，我先去探路，跟上。",
         "别磨蹭，我上去清场，你跟紧。",
     ],
+    "blessing_picked": [
+        "印烙好了，下一层别手软。",
+        "行，这印能用，继续往下探。",
+        "狱印成了，跟紧我进下一层。",
+    ],
+    "room_cleared": [
+        "门开了，贴右边走。",
+        "清完了，往前门那边靠。",
+    ],
+    "room_enter_elite": [
+        "精英房，留神它的技能。",
+        "这间有硬茬，别贪刀。",
+    ],
+    "hazard_dodge": [
+        "圈要炸了，先出圈！",
+        "地面落印了，别踩圈里！",
+    ],
+    "player_silenced": [
+        "缄言封着你呢，先走位别硬射。",
+        "你嘴被封了，躲圈等我打。",
+    ],
 }
 
 
@@ -129,6 +158,21 @@ def _b(scene: dict[str, Any], key: str, default: bool = False) -> bool:
     if isinstance(val, str):
         return val.lower() in ("1", "true", "yes")
     return bool(val)
+
+
+def _room_clear_still_actionable(scene_info: dict[str, Any], events: list[Any]) -> bool:
+    """清房台词仅在「当前仍站在已清未走的房间」时成立。"""
+    if "room_enter" in events or "floor_enter" in events:
+        return False
+    if str(scene_info.get("floor_state", "playing")) != "playing":
+        return False
+    if not _b(scene_info, "room_cleared"):
+        return False
+    if not _b(scene_info, "door_open"):
+        return False
+    if _i(scene_info, "enemy_count") > 0:
+        return False
+    return True
 
 
 def _ally_near_player(scene: dict[str, Any], *, threshold: float = 80) -> bool:
@@ -165,7 +209,7 @@ def assault_recommended(
     if player_pct < float(triggers.get("assault_min_player_hp_pct", 0.35)):
         return False
 
-    max_enemies = int(triggers.get("assault_max_enemies", 8))
+    max_enemies = int(triggers.get("assault_max_enemies", 10))
     if _i(scene_info, "enemy_count") > max_enemies:
         return False
 
@@ -248,7 +292,6 @@ def evaluate_p0(scene_info: dict[str, Any], cfg: dict[str, Any]) -> TriggerSpeec
                 intent="call_for_help",
                 reply=_pick("call_for_help_guarding"),
                 reason="ally_critical_guarding",
-                skip_dedup=True,
             )
         if ally_stance == "assault" and not near_player:
             return TriggerSpeech(
@@ -257,14 +300,12 @@ def evaluate_p0(scene_info: dict[str, Any], cfg: dict[str, Any]) -> TriggerSpeec
                 stance="guard",
                 reply=_pick("call_for_help"),
                 reason="ally_critical_retreat",
-                skip_dedup=True,
             )
         return TriggerSpeech(
             type="dialogue",
             intent="call_for_help",
             reply=_pick("call_for_help"),
             reason="ally_critical",
-            skip_dedup=True,
         )
 
     if player_pct <= player_danger and ally_stance == "assault":
@@ -306,6 +347,31 @@ def evaluate_p1(
     floor = _i(scene_info, "floor")
     events = scene_info.get("recent_events") or []
 
+    if (
+        (kind == "blessing_picked" or "blessing_picked" in events)
+        and "floor_enter" not in events
+        and (scene_info.get("blessing_just_picked") or str(scene_info.get("floor_state", "")) == "blessing_pick")
+    ):
+        picked = scene_info.get("blessing_just_picked") or {}
+        name = str(picked.get("name", "")).strip()
+        reply = _pick("blessing_picked")
+        if name:
+            reply = f"「{name}」烙好了。{reply}"
+        return TriggerSpeech(
+            type="dialogue",
+            intent="blessing_picked",
+            reply=reply,
+            reason="blessing_picked",
+        )
+
+    if ("room_enter" in events or kind == "room_enter") and str(scene_info.get("room_type", "")) == "elite":
+        return TriggerSpeech(
+            type="dialogue",
+            intent="room_enter_elite",
+            reply=_pick("room_enter_elite"),
+            reason="room_enter_elite",
+        )
+
     if kind in ("floor_enter", "opening") or "floor_enter" in events:
         assault = _evaluate_assault(scene_info, cfg, opening=True)
         if assault is not None:
@@ -319,12 +385,48 @@ def evaluate_p1(
                     reason="floor_enter",
                 )
 
+    if ("room_cleared" in events or kind == "room_cleared") and _room_clear_still_actionable(scene_info, events):
+        return TriggerSpeech(
+            type="dialogue",
+            intent="room_cleared",
+            reply=_pick("room_cleared"),
+            reason="room_cleared",
+        )
+
     if "boss_spawn" in events and st.boss_warned_floor != floor:
+        bname = str(scene_info.get("boss_name", "")).strip()
+        reply = _pick("boss_spawn")
+        if bname:
+            reply = f"{bname}来了。{reply}"
         return TriggerSpeech(
             type="dialogue",
             intent="floor_react",
-            reply=_pick("boss_spawn"),
+            reply=reply,
             reason="boss_spawn",
+        )
+
+    if "boss_enrage" in events:
+        bname = str(scene_info.get("boss_name", "")).strip()
+        reply = _pick("boss_enrage")
+        if bname:
+            reply = f"{bname}{reply}"
+        return TriggerSpeech(
+            type="dialogue",
+            intent="tactical_bark",
+            reply=reply,
+            reason="boss_enrage",
+        )
+
+    if "elite_enrage" in events:
+        ename = str(scene_info.get("elite_name", "")).strip()
+        reply = _pick("elite_enrage")
+        if ename:
+            reply = f"{ename}：{reply}"
+        return TriggerSpeech(
+            type="dialogue",
+            intent="tactical_bark",
+            reply=reply,
+            reason="elite_enrage",
         )
 
     prev_ec = _i(scene_info, "prev_enemy_count", -1)
@@ -352,7 +454,14 @@ def evaluate_p1(
     if assault is not None:
         return assault
 
-    if "floor_clear" in events and st.combat_mood in ("engaged", "critical"):
+    if (
+        "floor_clear" in events
+        and st.combat_mood in ("engaged", "critical")
+        and _i(scene_info, "enemy_count") <= 0
+        and _b(scene_info, "room_cleared")
+        and "room_enter" not in events
+        and "floor_enter" not in events
+    ):
         return TriggerSpeech(
             type="dialogue",
             intent="relieved",
@@ -403,6 +512,20 @@ def evaluate_p2(
 
 
 def _evaluate_tactical(scene_info: dict[str, Any]) -> TriggerSpeech | None:
+    if _b(scene_info, "hazard_near_player"):
+        return TriggerSpeech(
+            type="dialogue",
+            intent="hazard_dodge",
+            reply=_pick("hazard_dodge"),
+            reason="hazard_near_player",
+        )
+    if _b(scene_info, "player_silenced"):
+        return TriggerSpeech(
+            type="dialogue",
+            intent="player_silenced",
+            reply=_pick("player_silenced"),
+            reason="player_silenced",
+        )
     nearest = _f(scene_info, "nearest_enemy_distance", 999)
     incoming_p = _i(scene_info, "incoming_bullets_player")
     incoming_a = _i(scene_info, "incoming_bullets_ally")

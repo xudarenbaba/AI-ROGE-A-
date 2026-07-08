@@ -15,6 +15,7 @@ from server.npc_backend.llm import (
     chat_completion_stream,
     classify_dialogue_memory,
     classify_intent,
+    fast_command_intent,
     generate_no_hp_reply,
 )
 from server.npc_backend.memory import MemoryStore
@@ -41,6 +42,31 @@ _VALID_EMOTIONS = {
 
 # delta 批量缓冲阈值（字符数）：积累到此长度或收到 LLM 流结束后统一 flush
 _DELTA_BATCH_CHARS = 8
+
+
+def _enrich_scene_info(
+    scene_info: dict[str, Any],
+    narrative_st: NarrativeState,
+    narrative: NarrativeStore,
+    autonomy_cfg: dict[str, Any],
+    *,
+    trigger: str = "",
+    trigger_reason: str = "",
+    priority: int = 3,
+    opening: bool = False,
+) -> dict[str, Any]:
+    assault_ok = assault_recommended(scene_info, autonomy_cfg, opening=opening)
+    return {
+        **scene_info,
+        "trigger": trigger or str(scene_info.get("trigger", "")),
+        "trigger_reason": trigger_reason or str(scene_info.get("trigger_reason", "")),
+        "priority": priority,
+        "scene_hash": scene_hash(scene_info),
+        "scene_dramatic_change": narrative.scene_dramatic_change(narrative_st, scene_info),
+        "prev_enemy_count": narrative_st.prev_enemy_count,
+        "assault_recommended": assault_ok,
+        "combat_mood": narrative_st.combat_mood,
+    }
 
 
 class NpcConversationEngine:
@@ -83,6 +109,14 @@ class NpcConversationEngine:
         self._narrative.on_player_message(player_id, npc_id)
         narrative_st = self._narrative.get(player_id, npc_id)
         self._narrative.update_mood(narrative_st, scene_info)
+        autonomy_cfg = self._cfg.get("npc_autonomy", {})
+        scene_info = _enrich_scene_info(
+            scene_info,
+            narrative_st,
+            self._narrative,
+            autonomy_cfg,
+            trigger="reactive",
+        )
         _cancel, generation = self._inflight.begin(player_id, npc_id, "chat")
         yield _event("meta", {
             "npc_id": npc_id,
@@ -90,15 +124,9 @@ class NpcConversationEngine:
         })
 
         try:
-            narrative_ctx = self._narrative.context_for_prompt(player_id, npc_id)
             query = f"scene={scene_info}\nmessage={message}"
+            fast_intent = fast_command_intent(message)
 
-            fut_intent: Future[dict[str, Any]] = self._pool.submit(
-                classify_intent,
-                message=message,
-                scene_info=scene_info,
-                npc_name=npc_name,
-            )
             fut_short: Future[list[dict[str, Any]]] = self._pool.submit(
                 self._short_term.get_recent, player_id, npc_id
             )
@@ -109,8 +137,19 @@ class NpcConversationEngine:
                 npc_id,
                 self._pool,
             )
+            fut_narrative: Future[dict[str, str]] = self._pool.submit(
+                self._narrative.context_for_prompt, player_id, npc_id
+            )
+            fut_intent: Future[dict[str, Any]] | None = None
+            if fast_intent is None:
+                fut_intent = self._pool.submit(
+                    classify_intent,
+                    message=message,
+                    scene_info=scene_info,
+                    npc_name=npc_name,
+                )
 
-            intent = fut_intent.result()
+            intent = fast_intent if fast_intent is not None else fut_intent.result()
 
             if self._inflight.is_cancelled(player_id, npc_id, generation):
                 return
@@ -133,9 +172,12 @@ class NpcConversationEngine:
 
             short_term_history: list[dict[str, Any]] = fut_short.result()
             long_term_ctx: dict[str, list[str]] = fut_long.result()
+            narrative_ctx: dict[str, str] = fut_narrative.result()
 
             if self._inflight.is_cancelled(player_id, npc_id, generation):
                 return
+
+            yield _event("typing", {"active": True})
 
             messages = build_messages(
                 npc_name=npc_name,
@@ -180,26 +222,37 @@ class NpcConversationEngine:
             yield _event("noop", {"reason": "disabled"})
             return
 
+        if scene_info.get("can_autonomy_speak") is False:
+            yield _event("noop", {"reason": "silent_phase"})
+            return
+
         narrative_st = self._narrative.get(player_id, npc_id)
         self._narrative.update_mood(narrative_st, scene_info)
         opening = trigger_reason in ("floor_enter", "opening") or "floor_enter" in (
             scene_info.get("recent_events") or []
         )
-        assault_ok = assault_recommended(
-            scene_info, autonomy_cfg, opening=opening,
+        scene_info = _enrich_scene_info(
+            scene_info,
+            narrative_st,
+            self._narrative,
+            autonomy_cfg,
+            trigger=trigger,
+            trigger_reason=trigger_reason,
+            priority=priority,
+            opening=opening,
         )
-        scene_info = {
-            **scene_info,
-            "trigger": trigger,
-            "trigger_reason": trigger_reason,
-            "priority": priority,
-            "scene_hash": scene_hash(scene_info),
-            "scene_dramatic_change": self._narrative.scene_dramatic_change(
-                narrative_st, scene_info
-            ),
-            "prev_enemy_count": narrative_st.prev_enemy_count,
-            "assault_recommended": assault_ok,
-        }
+
+        situation = (
+            f"第{scene_info.get('floor', '?')}层"
+            f" 玩家HP={scene_info.get('player_hp', '?')}"
+            f" 友军HP={scene_info.get('ally_hp', '?')}"
+            f" 敌={scene_info.get('enemy_count', '?')}"
+        )
+        prefetch_query = f"scene={scene_info}\ntrigger={trigger}\nsituation={situation}"
+        fut_short = self._pool.submit(self._short_term.get_recent, player_id, npc_id)
+        fut_long = self._pool.submit(
+            self._memory.search_context, prefetch_query, player_id, npc_id, self._pool,
+        )
 
         rule_speech: TriggerSpeech | None = None
         if priority <= 0:
@@ -240,6 +293,16 @@ class NpcConversationEngine:
 
         try:
             if rule_speech is not None:
+                cd_reason = self._narrative.can_speak(
+                    narrative_st, priority=priority, trigger=trigger,
+                )
+                if cd_reason:
+                    self._narrative.record_outcome(
+                        player_id, npc_id,
+                        decision={"type": "noop"}, scene_info=scene_info,
+                    )
+                    yield _event("noop", {"reason": cd_reason})
+                    return
                 decision = trigger_to_decision(rule_speech)
                 validated, reject = self._narrative.validate_decision(
                     decision,
@@ -267,8 +330,9 @@ class NpcConversationEngine:
                     scene_info=scene_info,
                     generation=generation,
                     memory_tag=f"[NPC自主/{rule_speech.intent}]",
-                    polish_template=rule_speech.reply if rule_speech.allow_polish else None,
                     polish_intent=rule_speech.intent,
+                    priority=priority,
+                    skip_polish=True,
                 )
                 return
 
@@ -293,23 +357,13 @@ class NpcConversationEngine:
                         scene_info=scene_info,
                         generation=generation,
                         memory_tag="[NPC自主/reflex]",
+                        priority=priority,
+                        skip_polish=True,
                     )
                     return
 
             allowed = self._allowed_intents_for_trigger(
                 trigger, narrative_st, scene_info,
-            )
-            situation = (
-                f"第{scene_info.get('floor', '?')}层"
-                f" 玩家HP={scene_info.get('player_hp', '?')}"
-                f" 友军HP={scene_info.get('ally_hp', '?')}"
-                f" 敌={scene_info.get('enemy_count', '?')}"
-            )
-            query = f"scene={scene_info}\ntrigger={trigger}\nsituation={situation}"
-
-            fut_short = self._pool.submit(self._short_term.get_recent, player_id, npc_id)
-            fut_long = self._pool.submit(
-                self._memory.search_context, query, player_id, npc_id, self._pool
             )
             short_term_history = fut_short.result()
             long_term_ctx = fut_long.result()
@@ -379,8 +433,9 @@ class NpcConversationEngine:
                 scene_info=scene_info,
                 generation=generation,
                 memory_tag="[NPC自主/llm]",
-                polish_template=llm_polish,
                 polish_intent=rule_speech.intent if rule_speech else "",
+                priority=priority,
+                skip_polish=True,
             )
 
         except Exception as exc:  # noqa: BLE001
@@ -482,9 +537,13 @@ class NpcConversationEngine:
         npc_name: str = "",
         polish_template: str | None = None,
         polish_intent: str = "",
+        priority: int = 3,
+        skip_polish: bool = False,
     ) -> Iterator[str]:
         if self._inflight.is_cancelled(player_id, npc_id, generation):
             return
+
+        intent_tag = polish_intent or str(decision.get("intent", ""))
 
         decision_type = decision.get("type")
         if decision_type == "noop":
@@ -502,6 +561,7 @@ class NpcConversationEngine:
                 "stance": stance,
                 "reply": decision.get("reply", "收到。"),
                 "stance_changed": stance != current,
+                "intent": intent_tag,
             })
             reply = str(decision.get("reply", "")).strip()
             if reply:
@@ -513,15 +573,18 @@ class NpcConversationEngine:
                     reply=reply,
                     memory_source="autonomous",
                 )
-            yield from self._maybe_polish(
-                polish_template or reply,
-                player_id=player_id,
-                npc_id=npc_id,
-                npc_name=npc_name,
-                scene_info=scene_info,
-                generation=generation,
-                intent=polish_intent or str(decision.get("intent", "")),
-            )
+            if not skip_polish:
+                yield from self._maybe_polish(
+                    polish_template or reply,
+                    player_id=player_id,
+                    npc_id=npc_id,
+                    npc_name=npc_name,
+                    scene_info=scene_info,
+                    generation=generation,
+                    intent=intent_tag,
+                    skip=False,
+                    quick=priority >= 2,
+                )
             return
 
         if decision_type == "dialogue":
@@ -531,7 +594,10 @@ class NpcConversationEngine:
                 return
             emotion = "worried" if scene_info.get("ally_in_danger") else "focused"
             action = ChatAction(action_type="dialogue", dialogue=reply, emotion=emotion)
-            yield _event("done", {"action": action.model_dump(exclude_none=True)})
+            yield _event("done", {
+                "action": action.model_dump(exclude_none=True),
+                "intent": intent_tag,
+            })
             self._schedule_memory_write(
                 player_id=player_id,
                 npc_id=npc_id,
@@ -540,15 +606,18 @@ class NpcConversationEngine:
                 reply=reply,
                 memory_source="autonomous",
             )
-            yield from self._maybe_polish(
-                polish_template or reply,
-                player_id=player_id,
-                npc_id=npc_id,
-                npc_name=npc_name,
-                scene_info=scene_info,
-                generation=generation,
-                intent=polish_intent or str(decision.get("intent", "")),
-            )
+            if not skip_polish:
+                yield from self._maybe_polish(
+                    polish_template or reply,
+                    player_id=player_id,
+                    npc_id=npc_id,
+                    npc_name=npc_name,
+                    scene_info=scene_info,
+                    generation=generation,
+                    intent=intent_tag,
+                    skip=False,
+                    quick=priority >= 2,
+                )
             return
 
     def _maybe_polish(
@@ -561,8 +630,10 @@ class NpcConversationEngine:
         scene_info: dict[str, Any],
         generation: int,
         intent: str,
+        skip: bool = False,
+        quick: bool = False,
     ) -> Iterator[str]:
-        if not template or not npc_name:
+        if skip or not template or not npc_name:
             return
         st = self._narrative.get(player_id, npc_id)
         fut = self._pool.submit(
@@ -573,8 +644,9 @@ class NpcConversationEngine:
             recent_texts=st.recent_reply_texts,
             intent=intent,
         )
+        timeout = 0.35 if quick else 0.9
         try:
-            polished = fut.result(timeout=0.9)
+            polished = fut.result(timeout=timeout)
         except Exception:
             return
         if not polished or self._inflight.is_cancelled(player_id, npc_id, generation):
