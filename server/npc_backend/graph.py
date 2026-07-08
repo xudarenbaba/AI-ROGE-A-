@@ -30,6 +30,8 @@ from server.npc_backend.triggers import (
     evaluate_p1,
     evaluate_p2,
     evaluate_p3,
+    hint_for_scene,
+    stance_semantics,
     trigger_to_decision,
 )
 from server.npc_backend.schemas import ChatAction
@@ -66,6 +68,7 @@ def _enrich_scene_info(
         "prev_enemy_count": narrative_st.prev_enemy_count,
         "assault_recommended": assault_ok,
         "combat_mood": narrative_st.combat_mood,
+        "stance_semantics": stance_semantics(scene_info),
     }
 
 
@@ -264,7 +267,7 @@ class NpcConversationEngine:
         elif priority >= 3:
             rule_speech = evaluate_p3(scene_info, narrative_st, autonomy_cfg)
 
-        if rule_speech is None:
+        if rule_speech is None or rule_speech.mode != "hard":
             rule_reason = self._narrative.should_rule_noop(
                 narrative_st, scene_info, priority=priority
             )
@@ -292,7 +295,7 @@ class NpcConversationEngine:
         })
 
         try:
-            if rule_speech is not None:
+            if rule_speech is not None and rule_speech.mode == "hard":
                 cd_reason = self._narrative.can_speak(
                     narrative_st, priority=priority, trigger=trigger,
                 )
@@ -312,7 +315,7 @@ class NpcConversationEngine:
                     priority=priority,
                 )
                 self._log.info(
-                    "think rule_speech player=%s intent=%s type=%s reject=%s",
+                    "think rule_hard player=%s intent=%s type=%s reject=%s",
                     player_id, rule_speech.intent, validated.get("type"), reject or "-",
                 )
                 self._narrative.record_outcome(
@@ -372,10 +375,17 @@ class NpcConversationEngine:
                 return
 
             narrative_ctx = self._narrative.context_for_prompt(player_id, npc_id)
+            llm_scene = {
+                **scene_info,
+                "rule_hints": hint_for_scene(rule_speech),
+                "stance_semantics": stance_semantics(scene_info),
+            }
+            polish_cfg = autonomy_cfg.get("polish", {})
+            llm_polish_enabled = bool(polish_cfg.get("autonomous_quick", True))
             decision = self._pool.submit(
                 autonomous_decide,
                 npc_name=npc_name,
-                scene_info=scene_info,
+                scene_info=llm_scene,
                 world_chunks=long_term_ctx.get("world_chunks", []),
                 persona_chunks=long_term_ctx.get("persona_chunks", []),
                 dialogue_daily_chunks=long_term_ctx.get("dialogue_daily_chunks", []),
@@ -387,14 +397,15 @@ class NpcConversationEngine:
             ).result()
 
             validated, reject = self._narrative.validate_decision(
-                decision, narrative_st, scene_info, priority=priority,
+                decision, narrative_st, llm_scene, priority=priority,
             )
-            if validated.get("type") == "noop" and trigger in ("periodic", "social"):
-                fallback = evaluate_p3(
+            fallback_speech: TriggerSpeech | None = None
+            if validated.get("type") == "noop" and trigger in ("periodic", "social", "scene_change"):
+                fallback_speech = evaluate_p3(
                     scene_info, narrative_st, autonomy_cfg, force_banter=True,
                 )
-                if fallback is not None:
-                    fb_decision = trigger_to_decision(fallback)
+                if fallback_speech is not None and fallback_speech.mode == "hard":
+                    fb_decision = trigger_to_decision(fallback_speech)
                     validated, reject = self._narrative.validate_decision(
                         fb_decision,
                         narrative_st,
@@ -402,17 +413,43 @@ class NpcConversationEngine:
                         priority=priority,
                     )
                     self._log.info(
-                        "think llm_noop_fallback player=%s intent=%s type=%s",
-                        player_id, fallback.intent, validated.get("type"),
+                        "think fallback_hard player=%s intent=%s type=%s",
+                        player_id, fallback_speech.intent, validated.get("type"),
                     )
                     decision = fb_decision
-                    rule_speech = fallback
+                    yield from self._yield_validated_decision(
+                        validated,
+                        player_id=player_id,
+                        npc_id=npc_id,
+                        npc_name=npc_name,
+                        scene_info=scene_info,
+                        generation=generation,
+                        memory_tag=f"[NPC自主/{fallback_speech.intent}]",
+                        polish_intent=fallback_speech.intent,
+                        priority=priority,
+                        skip_polish=True,
+                    )
+                    return
+                if fallback_speech is not None:
+                    fb_decision = trigger_to_decision(fallback_speech)
+                    validated, reject = self._narrative.validate_decision(
+                        fb_decision,
+                        narrative_st,
+                        llm_scene,
+                        priority=priority,
+                    )
+                    self._log.info(
+                        "think llm_noop_fallback player=%s intent=%s type=%s",
+                        player_id, fallback_speech.intent, validated.get("type"),
+                    )
+                    decision = fb_decision
             if self._inflight.is_cancelled(player_id, npc_id, generation):
                 return
 
             self._log.info(
-                "think llm player=%s raw=%s val=%s reject=%s",
+                "think llm player=%s raw=%s val=%s reject=%s hints=%s",
                 player_id, decision.get("type"), validated.get("type"), reject or "-",
+                len(llm_scene.get("rule_hints") or []),
             )
             self._narrative.record_outcome(
                 player_id, npc_id,
@@ -420,11 +457,14 @@ class NpcConversationEngine:
                 rejected_reason=reject,
                 intent=str(decision.get("intent", "")),
             )
-            llm_polish = (
-                rule_speech.reply
-                if rule_speech is not None and rule_speech.allow_polish
-                else None
-            )
+            mem_tag = "[NPC自主/llm]"
+            polish_intent = str(decision.get("intent", ""))
+            skip_polish = not llm_polish_enabled
+            polish_template = None
+            if fallback_speech is not None and fallback_speech.mode == "fallback":
+                mem_tag = f"[NPC自主/{fallback_speech.intent}]"
+                polish_intent = fallback_speech.intent
+                polish_template = fallback_speech.reply
             yield from self._yield_validated_decision(
                 validated,
                 player_id=player_id,
@@ -432,10 +472,12 @@ class NpcConversationEngine:
                 npc_name=npc_name,
                 scene_info=scene_info,
                 generation=generation,
-                memory_tag="[NPC自主/llm]",
-                polish_intent=rule_speech.intent if rule_speech else "",
+                memory_tag=mem_tag,
+                polish_intent=polish_intent,
+                polish_template=polish_template,
                 priority=priority,
-                skip_polish=True,
+                skip_polish=skip_polish,
+                quick=priority >= 1,
             )
 
         except Exception as exc:  # noqa: BLE001
@@ -539,10 +581,12 @@ class NpcConversationEngine:
         polish_intent: str = "",
         priority: int = 3,
         skip_polish: bool = False,
+        quick: bool | None = None,
     ) -> Iterator[str]:
         if self._inflight.is_cancelled(player_id, npc_id, generation):
             return
 
+        polish_quick = quick if quick is not None else priority >= 2
         intent_tag = polish_intent or str(decision.get("intent", ""))
 
         decision_type = decision.get("type")
@@ -583,7 +627,7 @@ class NpcConversationEngine:
                     generation=generation,
                     intent=intent_tag,
                     skip=False,
-                    quick=priority >= 2,
+                    quick=polish_quick,
                 )
             return
 
@@ -616,7 +660,7 @@ class NpcConversationEngine:
                     generation=generation,
                     intent=intent_tag,
                     skip=False,
-                    quick=priority >= 2,
+                    quick=polish_quick,
                 )
             return
 

@@ -379,22 +379,34 @@
     }
   }
 
-  function spawnThornWall(state, boss) {
+  function spawnThornWall(state, boss, lock) {
     const ttl = boss.phase >= 2 ? 10 : 8;
-    const walls = [
-      { x: 360, y: 180, w: 18, h: 90, kind: "rubble", ttl },
-      { x: 520, y: 270, w: 18, h: 90, kind: "rubble", ttl },
-      { x: 400, y: 360, w: 90, h: 18, kind: "rubble", ttl },
+    const preferX = lock?.x ?? state.player.x;
+    const preferY = lock?.y ?? state.player.y;
+    const anchor = window.GameSpawn?.findClearSpawnPos(preferX, preferY, 9, {})
+      ?? { x: preferX, y: preferY };
+    const segments = [
+      { dx: -42, dy: -8, w: 18, h: 88 },
+      { dx: 24, dy: -8, w: 18, h: 88 },
+      { dx: -44, dy: 42, w: 88, h: 18 },
     ];
     if (boss.phase >= 2) {
-      walls.push({ x: 680, y: 180, w: 18, h: 90, kind: "rubble", ttl });
+      segments.push({ dx: -8, dy: -58, w: 18, h: 72 });
     }
+    const walls = segments.map((seg) => ({
+      x: Math.max(60, Math.min(anchor.x + seg.dx, 900 - seg.w)),
+      y: Math.max(60, Math.min(anchor.y + seg.dy, 480 - seg.h)),
+      w: seg.w,
+      h: seg.h,
+      kind: "rubble",
+      ttl,
+    }));
     state.tempObstacles = state.tempObstacles || [];
     walls.forEach((w) => {
       state.tempObstacles.push({ ...w, _ttl: w.ttl });
     });
     state.tempObstacles._dirty = true;
-    window.GameFx.floatText(boss.x, boss.y - 40, "荆棘墙", boss.aoeColor || "#ccaa66");
+    window.GameFx.floatText(anchor.x, anchor.y - 28, "荆棘墙", boss.aoeColor || "#ccaa66");
   }
 
   function mirrorShot(state, enemy, target) {
@@ -599,7 +611,7 @@
         break;
       }
       case "thorn_wall":
-        spawnThornWall(state, enemy);
+        spawnThornWall(state, enemy, lock);
         break;
       case "mirror_shot":
         if (canBulletHit(enemy, target, H)) {

@@ -26,6 +26,26 @@ def _enemy_breakdown_block(scene_info: dict[str, Any]) -> str:
     )
 
 
+def _rule_hints_block(scene_info: dict[str, Any]) -> str:
+    hints = scene_info.get("rule_hints") or []
+    if not hints:
+        return "无"
+    lines: list[str] = []
+    for item in hints:
+        if not isinstance(item, dict):
+            continue
+        intent = str(item.get("intent", "")).strip()
+        hint = str(item.get("hint", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not hint:
+            continue
+        parts = [f"intent={intent}" if intent else "", f"参考语气：{hint}"]
+        if reason:
+            parts.append(f"原因={reason}")
+        lines.append("；".join(p for p in parts if p))
+    return "\n".join(f"- {line}" for line in lines) if lines else "无"
+
+
 def _blessings_block(scene_info: dict[str, Any]) -> str:
     summary = scene_info.get("blessings_summary") or {}
     tags = summary.get("tags") or scene_info.get("build_tags") or []
@@ -252,7 +272,10 @@ _AUTONOMOUS_DECIDE_RULES = (
     "4d. can_autonomy_speak=false（选印/过门）时只输出 noop。\n"
     "4e. player_silenced=true 时不要催玩家射击。\n"
     "4f. hazard_near_player=true 时提醒躲圈，优先 dialogue。\n"
-    "4c. guard 贴身时 dialogue 禁止喊「过来」；但 assault 不受此限。\n"
+    "4c. guard 且 ally_near_player/ally_already_guarding=true 时，"
+    "dialogue 禁止喊「跟紧我/过来/靠近/别愣着」让玩家过来；可说「我贴着你/别冲太前」。"
+    "assault 不受此限。\n"
+    "4g. 参考[姿态语义]与[规则参考]组织台词，勿颠倒跟随关系。\n"
     "5. reply 符合嘴臭话痨风格，简短，1句话，且必须新颖不重复。\n"
     "6. dialogue 回复末尾不要加 emotion 标签。\n"
     "7. 当前姿态与目标 stance 相同时，必须输出 noop，不要 command。\n"
@@ -285,8 +308,11 @@ def build_autonomous_decide_messages(
     )
     intent_hint = "、".join(allowed_intents) if allowed_intents else "noop、command、dialogue"
     context = build_scene_context_blocks(scene_info, narrative_context)
+    stance_sem = str(scene_info.get("stance_semantics", "")).strip() or "无"
     user_prompt = (
         f"{context}\n\n"
+        f"[姿态语义]\n{stance_sem}\n\n"
+        f"[规则参考]\n{_rule_hints_block(scene_info)}\n\n"
         f"[本轮建议intent]\n{intent_hint}\n\n"
         f"[触发类型]\n{trigger}\n\n"
         f"[世界观设定]\n{_join_lines(world_chunks)}\n\n"

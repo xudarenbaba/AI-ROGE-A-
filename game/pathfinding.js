@@ -1,6 +1,6 @@
-// ── pathfinding.js — 栅格 A* 寻路模块（assault 姿态 APPROACH 阶段专用）──────────
+// ── pathfinding.js — 栅格 A* 寻路模块（ally 绕障移动）──────────────────────────
 //
-// 职责：在 assault 的"接近"阶段，绕过矩形障碍物把 ally 带到敌人射程内。
+// 职责：assault 接近阶段绕障到交战锚点；guard 回贴玩家时绕障跟随。
 // 战斗微操（射程内走位/风筝/躲弹）由 RL 负责，与本模块零重叠。
 //
 // 设计：
@@ -228,4 +228,8 @@ function steerAlong(path, pos, obstacles, agentRadius) {
   const len = Math.hypot(dx, dy);
   if (len < 1e-4) return [0, 0];
   return [dx / len, dy / len];
+}
+
+function segmentClear(ax, ay, bx, by, radius, obstacles) {
+  return pfSegmentClear(ax, ay, bx, by, radius, obstacles);
 }

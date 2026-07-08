@@ -68,6 +68,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "assault_max_nearest_dist": 420,
         },
         "assault_stance_cooldown_s": 10,
+        "polish": {
+            "autonomous_quick": True,
+        },
     },
     "concurrency": {
         "worker_threads": 8,

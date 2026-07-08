@@ -221,6 +221,24 @@ class NarrativeStore:
             return f"speech_cooldown({speech_cd}s)"
         return None
 
+    @staticmethod
+    def _violates_guard_dialogue(reply: str, scene_info: dict[str, Any]) -> bool:
+        stance = str(scene_info.get("ally_stance", "guard"))
+        if stance != "guard":
+            return False
+        near = bool(
+            scene_info.get("ally_near_player")
+            or scene_info.get("ally_already_guarding")
+        )
+        if not near:
+            return False
+        norm = _normalize_text(reply)
+        banned = (
+            "跟紧我", "跟紧", "过来", "靠近", "别愣着", "别发呆", "别乱跑",
+            "跟我", "跟上我", "快过来", "你倒是过来", "别掉队",
+        )
+        return any(_normalize_text(phrase) in norm for phrase in banned)
+
     def should_rule_noop(
         self,
         st: NarrativeState,
@@ -232,9 +250,9 @@ class NarrativeStore:
         now = now or time.time()
         autonomy = self._cfg
 
+        trigger = str(scene_info.get("trigger", ""))
         if priority <= 0:
             return self.can_speak(st, priority=priority, trigger=trigger)
-        trigger = str(scene_info.get("trigger", ""))
 
         if trigger in ("social", "periodic"):
             since_speech = float(scene_info.get("since_last_npc_speech", 0) or 0)
@@ -296,6 +314,9 @@ class NarrativeStore:
                 if priority <= 1:
                     return {"type": "noop"}, "duplicate_reply_soft"
                 return {"type": "noop"}, "duplicate_reply"
+
+        if reply and self._violates_guard_dialogue(reply, scene_info):
+            return {"type": "noop"}, "guard_coherence"
 
         if dtype == "command":
             stance = str(decision.get("stance", "")).strip()

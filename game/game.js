@@ -39,6 +39,12 @@ const _COMBAT_EXIT_DIST_MUL    = 1.3;
 const _COMBAT_HOLD_MAX_SEC     = 2.5;    // 1c：已废除 hold 阶段，常量保留避免牵连
 const _COMBAT_LOS_LOST_EXIT_FRAMES = 24; // 1c：combat 中连续丢 LOS ≥24帧(0.4s)才退回 approach
 const _ENGAGE_POINT_REACH      = 20;
+const _GUARD_FOLLOW_START      = 55;
+const _GUARD_FOLLOW_STOP       = 45;
+const _GUARD_REPLAN_MOVE       = 24;
+const _GUARD_PATH_STALE_DIST   = 50;
+const _GUARD_REPLAN_INTERVAL   = 0.2;
+const _GUARD_WEDGED_REPLAN_SEC = 0.3;
 const _SAFE_HOLD_TTA_SEC       = 0.40;  // 方案A：不再用于强制静止（保留常量备用）
 const _EMERGENCY_DODGE_TTA_SEC = 0.25;
 const _MIN_ACTION_HOLD_FRAMES  = 3;     // 方案A：5 → 3（约 50ms，防抖更轻）
@@ -558,6 +564,11 @@ const state = {
     navPath: null,
     navReplanCd: 0,
     navGoal: null,
+    guardNavPath: null,
+    guardNavGoal: null,
+    guardReplanCd: 0,
+    guardFollowPt: null,
+    guardWedgedT: 0,
     engagePoint: null,
     losStableFrames: 0,
     losLostFrames: 0,         // 1c：combat 中连续丢 LOS 帧数，≥阈值退回 approach
@@ -869,6 +880,7 @@ function loadRoom(index) {
   if (_rlLoadState === "ready") _rlResetLstmState();
   state.ally.combatPhase = "approach";
   state.ally.navPath = null;
+  clearGuardNav(state.ally);
   state.ally.engagePoint = null;
   state.ally.losStableFrames = 0;
   state.ally.losLostFrames = 0;
@@ -1042,6 +1054,13 @@ function tickEntityStuckEscape(entity, dt, opts = {}) {
   entity._stuckPrevX = entity.x;
   entity._stuckPrevY = entity.y;
   if (entity.navPath) entity.navPath = null;
+  if (entity.guardNavPath) {
+    entity.guardNavPath = null;
+    entity.guardNavGoal = null;
+    entity.guardReplanCd = 0;
+    entity.guardWedgedT = 0;
+    if (entity === state.ally && state._rebuildNav) state._rebuildNav();
+  }
   window.GameFx.floatText(entity.x, entity.y - 42, opts.free || "脱困", "#9fe4ff");
   window.GameFx.burst(entity.x, entity.y, "#9fe4ff", 6);
   if (opts.bubble) setAllyBubble(opts.bubble);
@@ -1078,6 +1097,7 @@ function nextFloor() {
   if (_rlLoadState === "ready") _rlResetLstmState();
   state.ally.combatPhase = "approach";
   state.ally.navPath = null;
+  clearGuardNav(state.ally);
   state.ally.engagePoint = null;
   state.ally.losStableFrames = 0;
   state.ally.losLostFrames = 0;
@@ -1410,7 +1430,149 @@ function findEngagePoint(target, cfg) {
   return best || { x: target.x, y: target.y };
 }
 
-// APPROACH 阶段：按节流策略重规划到交战锚点的 A* 路径
+function clearGuardNav(ally = state.ally) {
+  ally.guardNavPath = null;
+  ally.guardNavGoal = null;
+  ally.guardFollowPt = null;
+  ally.guardWedgedT = 0;
+}
+
+function findGuardFollowCandidates(player) {
+  const ally = state.ally;
+  const r = ally.radius;
+  const cands = [];
+  for (let i = 0; i < 16; i += 1) {
+    const angle = (2 * Math.PI * i) / 16;
+    for (const dist of [35, 40, 45]) {
+      const px = player.x + Math.cos(angle) * dist;
+      const py = player.y + Math.sin(angle) * dist;
+      if (px < r || px > canvas.width - r) continue;
+      if (py < r || py > canvas.height - r) continue;
+      if (collidesWithObstacle(px, py, r)) continue;
+      cands.push({
+        x: px,
+        y: py,
+        score: Math.hypot(px - ally.x, py - ally.y),
+      });
+    }
+  }
+  cands.sort((a, b) => a.score - b.score);
+  if (!cands.length && !collidesWithObstacle(player.x, player.y, r)) {
+    cands.push({
+      x: player.x,
+      y: player.y,
+      score: Math.hypot(player.x - ally.x, player.y - ally.y),
+    });
+  }
+  return cands;
+}
+
+function findGuardFollowPoint(player) {
+  const cands = findGuardFollowCandidates(player);
+  if (cands[0]) return { x: cands[0].x, y: cands[0].y };
+  return { x: player.x, y: player.y };
+}
+
+function guardPathEndpoint(path) {
+  if (!path || !path.length) return null;
+  return path[path.length - 1];
+}
+
+function isGuardPathStale(followPt) {
+  const end = guardPathEndpoint(state.ally.guardNavPath);
+  if (!end || !followPt) return true;
+  return Math.hypot(end.x - followPt.x, end.y - followPt.y) > _GUARD_PATH_STALE_DIST;
+}
+
+function guardSegmentClear(ax, ay, bx, by, radius) {
+  return segmentClear(ax, ay, bx, by, radius, allObstacles());
+}
+
+function planGuardFollow(dt, opts = {}) {
+  const { force = false, rebuild = false } = opts;
+  const a = state.ally;
+  const player = state.player;
+  const followPt = findGuardFollowPoint(player);
+  a.guardFollowPt = followPt;
+
+  if (!force) {
+    a.guardReplanCd = (a.guardReplanCd ?? 0) - dt;
+    const goalMoved = a.guardNavGoal
+      ? Math.hypot(followPt.x - a.guardNavGoal.x, followPt.y - a.guardNavGoal.y)
+      : Infinity;
+    const playerMoved = Math.hypot(
+      player.x - (a._guardLastPlayerX ?? player.x),
+      player.y - (a._guardLastPlayerY ?? player.y),
+    );
+    if (a.guardReplanCd > 0 && goalMoved < _GUARD_REPLAN_MOVE
+      && playerMoved < _GUARD_REPLAN_MOVE && a.guardNavPath) {
+      return followPt;
+    }
+  }
+
+  a.guardReplanCd = _GUARD_REPLAN_INTERVAL;
+  a._guardLastPlayerX = player.x;
+  a._guardLastPlayerY = player.y;
+
+  if (rebuild || force) rebuildNavGrid();
+  if (!_navGrid) rebuildNavGrid();
+
+  const cands = findGuardFollowCandidates(player);
+  for (let ci = 0; ci < Math.min(3, cands.length); ci += 1) {
+    const pt = cands[ci];
+    let raw = findPath(_navGrid, a, pt);
+    if (!raw) {
+      rebuildNavGrid();
+      raw = findPath(_navGrid, a, pt);
+    }
+    if (raw && raw.length) {
+      a.guardNavPath = raw;
+      a.guardNavGoal = { x: pt.x, y: pt.y };
+      a.guardFollowPt = { x: pt.x, y: pt.y };
+      return followPt;
+    }
+  }
+
+  a.guardNavPath = null;
+  return followPt;
+}
+
+function guardSteerDirection(followPt) {
+  const a = state.ally;
+  const obstacles = allObstacles();
+  if (a.guardNavPath && a.guardNavPath.length) {
+    const [mx, my] = steerAlong(a.guardNavPath, a, obstacles, a.radius);
+    if (Math.abs(mx) + Math.abs(my) > 1e-4) return [mx, my];
+    a.guardNavPath = null;
+  }
+  if (followPt && guardSegmentClear(a.x, a.y, followPt.x, followPt.y, a.radius)) {
+    return normalize(followPt.x - a.x, followPt.y - a.y);
+  }
+  return [0, 0];
+}
+
+function shouldGuardFollow(dist) {
+  const a = state.ally;
+  return dist > _GUARD_FOLLOW_START
+    || (dist > _GUARD_FOLLOW_STOP && !!a.guardNavPath);
+}
+
+function tickGuardWedged(dt, moved, chasing) {
+  const a = state.ally;
+  if (!chasing || moved >= Math.max(0.6, 1)) {
+    a.guardWedgedT = 0;
+    return;
+  }
+  a.guardWedgedT = (a.guardWedgedT || 0) + dt;
+  if (a.guardWedgedT >= _GUARD_WEDGED_REPLAN_SEC) {
+    a.guardNavPath = null;
+    a.guardReplanCd = 0;
+    a.guardWedgedT = 0;
+    rebuildNavGrid();
+  }
+}
+
+// assault APPROACH：按节流策略重规划到交战锚点的 A* 路径
 function maybeReplanNav(target, dt) {
   const a = state.ally;
   a.navReplanCd -= dt;
@@ -1435,10 +1597,23 @@ function updateAlly(dt) {
 
   if (state.ally.stance === "guard" || state.player.hp <= 40) {
     const d = distance(state.ally, state.player);
-    if (d > 50) {
+    const chasing = shouldGuardFollow(d);
+    if (chasing) {
       allyMoving = true;
-      const [nx, ny] = normalize(state.player.x - state.ally.x, state.player.y - state.ally.y);
-      moveWithCollision(state.ally, nx * speed * dt, ny * speed * dt);
+      const prevX = state.ally._guardMovePrevX ?? state.ally.x;
+      const prevY = state.ally._guardMovePrevY ?? state.ally.y;
+      let followPt = state.ally.guardFollowPt || findGuardFollowPoint(state.player);
+      const stale = isGuardPathStale(followPt);
+      planGuardFollow(dt, { force: !state.ally.guardNavPath || stale });
+      followPt = state.ally.guardFollowPt || followPt;
+      const [mx, my] = guardSteerDirection(followPt);
+      moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
+      const moved = Math.hypot(state.ally.x - prevX, state.ally.y - prevY);
+      state.ally._guardMovePrevX = state.ally.x;
+      state.ally._guardMovePrevY = state.ally.y;
+      tickGuardWedged(dt, moved, chasing && (Math.abs(mx) + Math.abs(my) > 1e-4));
+    } else {
+      state.ally.guardWedgedT = 0;
     }
     const target = findTargetForAlly();
     if (target && state.ally.attackCd <= 0) {
@@ -1659,6 +1834,11 @@ function checkDefeat() {
     state.ally.hp    = 0;
     state.ally.dead  = true;
     state.ally.stance = "guard";   // 自动切回守护
+    state.ally.navPath = null;
+    state.ally.navGoal = null;
+    state.ally.navReplanCd = 0;
+    clearGuardNav(state.ally);
+    state.ally.guardReplanCd = 0;
     setAllyBubble("灵核失稳...你先继续前进。");
     // 气泡只设一次（3秒），后续不再重置
   }
@@ -2684,12 +2864,22 @@ function applyStance(stance, reply, opts = {}) {
     ? opts.stanceChanged
     : state.ally.stance !== stance;
   if (stance === "assault" && stanceChanged) {
+    clearGuardNav(state.ally);
     state.ally.combatPhase = "approach";
     state.ally.navPath = null;
     state.ally.engagePoint = null;
     state.ally.losStableFrames = 0;
     state.ally.losLostFrames = 0;
     if (_rlLoadState === "ready") _rlResetLstmState();
+  }
+  if (stance === "guard" && stanceChanged) {
+    state.ally.navPath = null;
+    state.ally.navGoal = null;
+    state.ally.navReplanCd = 0;
+    clearGuardNav(state.ally);
+    state.ally.guardReplanCd = 0;
+    rebuildNavGrid();
+    planGuardFollow(0, { force: true });
   }
   state.ally.stance = stance;
   const label = STANCE_LABELS[stance] || stance;

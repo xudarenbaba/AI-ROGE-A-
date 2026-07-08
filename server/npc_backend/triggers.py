@@ -16,6 +16,7 @@ class TriggerSpeech:
     reason: str = ""
     allow_polish: bool = True
     skip_dedup: bool = False
+    mode: str = "hard"  # hard | hint | fallback
 
 
 _TEMPLATES: dict[str, list[str]] = {
@@ -54,9 +55,13 @@ _TEMPLATES: dict[str, list[str]] = {
         "就剩这几个了，别松懈。",
         "收尾了，集中火力。",
     ],
-    "floor_enter": [
-        "又下一层，别乱送，跟紧我。",
-        "新一层，先摸清敌人再冲。",
+    "floor_enter_guard": [
+        "新一层，我贴着你走，你别冲太前。",
+        "往下探了，跟在我这边，别乱跑。",
+    ],
+    "floor_enter_assault": [
+        "新一层，我先探路，你跟上。",
+        "往下探了，我先去清场，别掉队。",
     ],
     "boss_spawn": [
         "大家伙来了，别盯着小怪。",
@@ -70,10 +75,13 @@ _TEMPLATES: dict[str, list[str]] = {
         "精英厉怒了，技能加快！",
         "这精英半血了，当心连招。",
     ],
-    "banter": [
+    "banter_guard": [
+        "还行，我贴着你看，别冲太前。",
+        "啧，这局面还行，稳住别乱冲。",
+    ],
+    "banter_assault": [
         "你别光看着，想好怎么打没？",
         "还行，继续，别掉链子。",
-        "啧，这局面还行，别浪。",
     ],
     "relieved": [
         "行了，这波算稳住了。",
@@ -108,10 +116,13 @@ _TEMPLATES: dict[str, list[str]] = {
         "新一层开了，我先去探路，跟上。",
         "别磨蹭，我上去清场，你跟紧。",
     ],
-    "blessing_picked": [
-        "印烙好了，下一层别手软。",
+    "blessing_picked_guard": [
+        "印烙好了，我护着你继续往下。",
+        "行，这印能用，贴着我走别冲太前。",
+    ],
+    "blessing_picked_assault": [
+        "印烙好了，我先上，你跟上。",
         "行，这印能用，继续往下探。",
-        "狱印成了，跟紧我进下一层。",
     ],
     "room_cleared": [
         "门开了，贴右边走。",
@@ -133,8 +144,48 @@ _TEMPLATES: dict[str, list[str]] = {
 
 
 def _pick(intent: str) -> str:
-    pool = _TEMPLATES.get(intent, _TEMPLATES["banter"])
+    pool = _TEMPLATES.get(intent) or _TEMPLATES["banter_guard"]
     return random.choice(pool)
+
+
+def _ally_stance(scene: dict[str, Any]) -> str:
+    return str(scene.get("ally_stance", "guard"))
+
+
+def _pick_stance(scene: dict[str, Any], guard_key: str, assault_key: str) -> str:
+    if _ally_stance(scene) == "assault":
+        return _pick(assault_key)
+    return _pick(guard_key)
+
+
+def _as_hint(speech: TriggerSpeech) -> TriggerSpeech:
+    if speech.mode == "hint":
+        return speech
+    return TriggerSpeech(
+        type=speech.type,
+        intent=speech.intent,
+        reply=speech.reply,
+        stance=speech.stance,
+        reason=speech.reason,
+        allow_polish=speech.allow_polish,
+        skip_dedup=speech.skip_dedup,
+        mode="hint",
+    )
+
+
+def _as_hard(speech: TriggerSpeech) -> TriggerSpeech:
+    if speech.mode == "hard":
+        return speech
+    return TriggerSpeech(
+        type=speech.type,
+        intent=speech.intent,
+        reply=speech.reply,
+        stance=speech.stance,
+        reason=speech.reason,
+        allow_polish=speech.allow_polish,
+        skip_dedup=speech.skip_dedup,
+        mode="hard",
+    )
 
 
 def _f(scene: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -248,6 +299,7 @@ def _evaluate_assault(
         stance="assault",
         reply=_pick(intent_key),
         reason="assault_opening" if opening else "assault_opportunity",
+        mode="hard",
     )
 
 
@@ -354,23 +406,23 @@ def evaluate_p1(
     ):
         picked = scene_info.get("blessing_just_picked") or {}
         name = str(picked.get("name", "")).strip()
-        reply = _pick("blessing_picked")
+        reply = _pick_stance(scene_info, "blessing_picked_guard", "blessing_picked_assault")
         if name:
             reply = f"「{name}」烙好了。{reply}"
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="blessing_picked",
             reply=reply,
             reason="blessing_picked",
-        )
+        ))
 
     if ("room_enter" in events or kind == "room_enter") and str(scene_info.get("room_type", "")) == "elite":
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="room_enter_elite",
             reply=_pick("room_enter_elite"),
             reason="room_enter_elite",
-        )
+        ))
 
     if kind in ("floor_enter", "opening") or "floor_enter" in events:
         assault = _evaluate_assault(scene_info, cfg, opening=True)
@@ -378,77 +430,77 @@ def evaluate_p1(
             return assault
         if kind == "floor_enter" or "floor_enter" in events:
             if st.last_floor_commented != floor:
-                return TriggerSpeech(
+                return _as_hint(TriggerSpeech(
                     type="dialogue",
                     intent="floor_react",
-                    reply=_pick("floor_enter"),
+                    reply=_pick_stance(scene_info, "floor_enter_guard", "floor_enter_assault"),
                     reason="floor_enter",
-                )
+                ))
 
     if ("room_cleared" in events or kind == "room_cleared") and _room_clear_still_actionable(scene_info, events):
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="room_cleared",
             reply=_pick("room_cleared"),
             reason="room_cleared",
-        )
+        ))
 
     if "boss_spawn" in events and st.boss_warned_floor != floor:
         bname = str(scene_info.get("boss_name", "")).strip()
         reply = _pick("boss_spawn")
         if bname:
             reply = f"{bname}来了。{reply}"
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="floor_react",
             reply=reply,
             reason="boss_spawn",
-        )
+        ))
 
     if "boss_enrage" in events:
         bname = str(scene_info.get("boss_name", "")).strip()
         reply = _pick("boss_enrage")
         if bname:
             reply = f"{bname}{reply}"
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="tactical_bark",
             reply=reply,
             reason="boss_enrage",
-        )
+        ))
 
     if "elite_enrage" in events:
         ename = str(scene_info.get("elite_name", "")).strip()
         reply = _pick("elite_enrage")
         if ename:
             reply = f"{ename}：{reply}"
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="tactical_bark",
             reply=reply,
             reason="elite_enrage",
-        )
+        ))
 
     prev_ec = _i(scene_info, "prev_enemy_count", -1)
     ec = _i(scene_info, "enemy_count")
     if prev_ec >= 0:
         if ec - prev_ec >= 3:
-            return TriggerSpeech(
+            return _as_hint(TriggerSpeech(
                 type="dialogue",
                 intent="tactical_bark",
                 reply=_pick("tactical_surge"),
                 reason="enemy_surge",
-            )
+            ))
         if prev_ec >= 3 and ec <= 1:
             thin_assault = _evaluate_assault(scene_info, cfg)
             if thin_assault is not None:
                 return thin_assault
-            return TriggerSpeech(
+            return _as_hint(TriggerSpeech(
                 type="dialogue",
                 intent="tactical_bark",
                 reply=_pick("tactical_thin"),
                 reason="enemy_thin",
-            )
+            ))
 
     assault = _evaluate_assault(scene_info, cfg)
     if assault is not None:
@@ -462,12 +514,12 @@ def evaluate_p1(
         and "room_enter" not in events
         and "floor_enter" not in events
     ):
-        return TriggerSpeech(
+        return _as_hint(TriggerSpeech(
             type="dialogue",
             intent="relieved",
             reply=_pick("enemy_clear"),
             reason="floor_clear",
-        )
+        ))
 
     return None
 
@@ -486,29 +538,13 @@ def evaluate_p2(
 
     tactical = _evaluate_tactical(scene_info)
     if tactical is not None:
-        return tactical
+        return _as_hint(tactical)
 
     assault = _evaluate_assault(scene_info, cfg)
     if assault is not None:
         return assault
 
-    if since_speech < social_s:
-        return None
-
-    if st.combat_mood == "relieved":
-        return TriggerSpeech(
-            type="dialogue",
-            intent="relieved",
-            reply=_pick("relieved"),
-            reason="mood_relieved",
-        )
-
-    return TriggerSpeech(
-        type="dialogue",
-        intent="banter",
-        reply=_pick("banter"),
-        reason="social_beat",
-    )
+    return None
 
 
 def _evaluate_tactical(scene_info: dict[str, Any]) -> TriggerSpeech | None:
@@ -576,33 +612,63 @@ def evaluate_p3(
     social_s = float(triggers.get("social_beat_s", 45))
     since_speech = _f(scene_info, "since_last_npc_speech", 999)
 
+    if not force_banter:
+        return None
+
     if st.combat_mood == "critical":
         return None
 
     tactical = _evaluate_tactical(scene_info)
     if tactical is not None:
-        return tactical
+        return TriggerSpeech(
+            type=tactical.type,
+            intent=tactical.intent,
+            reply=tactical.reply,
+            stance=tactical.stance,
+            reason=tactical.reason,
+            mode="fallback",
+        )
 
     assault = _evaluate_assault(scene_info, cfg)
     if assault is not None:
         return assault
 
-    if force_banter or since_speech >= social_s:
-        if st.combat_mood == "relieved":
-            return TriggerSpeech(
-                type="dialogue",
-                intent="relieved",
-                reply=_pick("relieved"),
-                reason="mood_relieved",
-            )
+    if st.combat_mood == "relieved":
         return TriggerSpeech(
             type="dialogue",
-            intent="banter",
-            reply=_pick("banter"),
-            reason="periodic_banter",
+            intent="relieved",
+            reply=_pick("relieved"),
+            reason="mood_relieved",
+            mode="fallback",
         )
 
-    return None
+    return TriggerSpeech(
+        type="dialogue",
+        intent="banter",
+        reply=_pick_stance(scene_info, "banter_guard", "banter_assault"),
+        reason="periodic_banter",
+        mode="fallback",
+    )
+
+
+def hint_for_scene(speech: TriggerSpeech | None) -> list[dict[str, str]]:
+    if speech is None or speech.mode != "hint":
+        return []
+    return [{
+        "intent": speech.intent,
+        "hint": speech.reply,
+        "reason": speech.reason,
+    }]
+
+
+def stance_semantics(scene_info: dict[str, Any]) -> str:
+    stance = _ally_stance(scene_info)
+    if stance == "assault":
+        return "突击：乌枭前压开路，玩家在后支援，可说「跟上/我先上」。"
+    near = _ally_guarding_player(scene_info)
+    if near:
+        return "守护贴身：乌枭跟随玩家，禁喊「跟紧我/过来/别愣着」指玩家过来。"
+    return "守护：乌枭趋向玩家，禁把玩家当成需要被喊过来的一方。"
 
 
 def trigger_to_decision(speech: TriggerSpeech) -> dict[str, Any]:

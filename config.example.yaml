@@ -57,6 +57,8 @@ npc_autonomy:
     assault_max_enemies: 8
     assault_max_nearest_dist: 420
   assault_stance_cooldown_s: 10
+  polish:
+    autonomous_quick: true
 
 concurrency:
   worker_threads: 8

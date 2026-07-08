@@ -20,7 +20,11 @@ def polish_line(
     dist = scene_info.get("ally_player_distance", "?")
     spatial = (
         f"当前姿态={stance}，与玩家距离={dist}px。"
-        + ("已在玩家身边守护，台词禁止喊「过来/靠近/别愣着」。" if stance == "guard" and near else "")
+        + (
+            "已在玩家身边守护，台词禁止喊「跟紧我/过来/靠近/别愣着」让玩家过来。"
+            if stance == "guard" and near
+            else ""
+        )
     )
     system = (
         f"你是 NPC「{npc_name}」，嘴臭话痨。"
