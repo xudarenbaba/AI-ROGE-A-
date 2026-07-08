@@ -641,6 +641,8 @@ function eliteBossHpMul(room) {
   return mul;
 }
 
+const BOSS_DMG_MUL = 0.90;
+
 function eliteBossDmgMul(scale) {
   const stacks = (state.blessingsTaken || []).length;
   return scale.dmgMul * (1 + stacks * 0.05);
@@ -827,7 +829,7 @@ function spawnRoomEnemies(room) {
       radius: 20,
       speed: 32 * scale.speedMul,
       shootCd: 1.0,
-      dmgMul: eliteBossDmgMul(scale),
+      dmgMul: eliteBossDmgMul(scale) * BOSS_DMG_MUL,
       shootCdMul: scale.shootCdMul,
       fanChance: bossMeta.fanChance,
       ultInterval: bossMeta.ultInterval,
