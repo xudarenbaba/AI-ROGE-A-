@@ -8,8 +8,11 @@ train.py — 训练 assault 姿态策略网络。
     # 快速验证（5 万步，几分钟）
     python -m rl.train --timesteps 50000 --run-name debug
 
-    # 继续上次训练
+    # 从检查点继续，训练到累计 8000 万步（--timesteps 为总目标，非额外步数）
     python -m rl.train --resume rl/checkpoints/assault_1000000_steps.zip
+
+    # 在 8000 万步基础上再训 500 万（总目标 8500 万）
+    python -m rl.train --resume rl/checkpoints/assault_79999360_steps.zip --timesteps 85000000
 
 参数说明见 argparse 部分。
 输出：
@@ -100,7 +103,8 @@ class ProgressCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train assault RL policy (PPO)")
-    p.add_argument("--timesteps",      type=int,   default=DEFAULTS["timesteps"])
+    p.add_argument("--timesteps",      type=int,   default=DEFAULTS["timesteps"],
+                   help="累计训练总步数目标（resume 时也是总目标，不是额外步数）")
     p.add_argument("--n-envs",         type=int,   default=DEFAULTS["n_envs"])
     p.add_argument("--n-steps",        type=int,   default=DEFAULTS["n_steps"])
     p.add_argument("--batch-size",     type=int,   default=DEFAULTS["batch_size"])
@@ -172,12 +176,13 @@ def main() -> None:
             env=train_env,
             device="auto",
         )
-        remaining = args.timesteps - model.num_timesteps
+        start_steps = int(model.num_timesteps)
+        remaining = args.timesteps - start_steps
         if remaining <= 0:
-            print(f"Already trained {model.num_timesteps} steps, nothing to do.")
+            print(f"Already at {start_steps:,} steps (target {args.timesteps:,}), nothing to do.")
             return
-        print(f"Remaining steps: {remaining:,}")
-        total_ts = args.timesteps
+        # SB3 resume 时会把 learn(total_timesteps) 加上已有步数，故只传剩余步数。
+        total_ts = remaining
     else:
         model = RecurrentPPO(
             policy="MlpLstmPolicy",
@@ -207,7 +212,13 @@ def main() -> None:
     print(f"Policy MLP head: {DEFAULTS['net_arch']}")
     print(f"Observation dim: {AssaultEnv().observation_space.shape[0]}")
     print(f"Action space: {AssaultEnv().action_space.n} discrete actions")
-    print(f"Training for {total_ts:,} steps with {args.n_envs} envs\n")
+    if args.resume:
+        print(
+            f"Resume: {start_steps:,} → {args.timesteps:,} "
+            f"(+{total_ts:,} remaining, {args.n_envs} envs)\n"
+        )
+    else:
+        print(f"Training for {total_ts:,} steps with {args.n_envs} envs\n")
 
     # ── 训练 ─────────────────────────────────────────────────────────────────
     model.learn(

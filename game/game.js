@@ -1,5 +1,6 @@
 const NPC_API = "http://127.0.0.1:5100";
 const NPC_AUTONOMY_BUILD = "autonomy9";
+const GAME_BUILD = "upgrade1";
 
 // ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
 // onnxruntime-web 从 CDN 加载；如需离线部署可改为本地路径。
@@ -265,6 +266,7 @@ function _rlRaycast(ox, oy, dx, dy) {
   return 1.0;
 }
 
+// === RL FROZEN: _rlBuildObs / _rlResolveAction / ONNX — 训完前勿改 ===
 // 构建 109 维观测向量，与 rl/env.py _get_obs() 严格对齐（战斗专家版）
 function _rlBuildObs(attackCd) {
   const obs  = new Float32Array(_RL_OBS_DIM);
@@ -453,7 +455,10 @@ const FLOOR_META = [
 ];
 
 const state = {
-  player: { x: 180, y: 260, radius: 14, hp: 160, maxHp: 160, speed: 220, attackCd: 0, shieldCd: 0 },
+  player: {
+    x: 180, y: 260, radius: 14, hp: 160, maxHp: 160, speed: 220,
+    attackCd: 0, shieldCd: 0, dashCd: 0, dashInvuln: 0,
+  },
   ally: {
     x: 220,
     y: 290,
@@ -475,7 +480,18 @@ const state = {
     engagePoint: null,
     losStableFrames: 0,
     losLostFrames: 0,         // 1c：combat 中连续丢 LOS 帧数，≥阈值退回 approach
+    focusMode: null,
+    focusUntil: 0,
   },
+  combo: 0,
+  comboTimer: 0,
+  maxCombo: 0,
+  playerDamageMul: 1,
+  guardDamageReduction: 0.15,
+  dashCdMul: 1,
+  blessingShieldMul: 1,
+  blessingsTaken: [],
+  blessingChoices: [],
   enemies: [],
   playerBullets: [],
   allyBullets: [],
@@ -486,7 +502,7 @@ const state = {
   result: "",
   playerId: "player_web_demo",
   floor: 1,
-  floorState: "playing", // "playing" | "clear"
+  floorState: "playing", // "playing" | "blessing_pick" | "clear"
   transitionTimer: 0,
   cinders: [],
 };
@@ -550,57 +566,13 @@ function spawnEnemies(emitNpcEvents = true) {
   if (emitNpcEvents) npcPushEvent("boss_spawn", { floor: state.floor });
 }
 
-// ── 障碍物 ────────────────────────────────────────────────────────────────────
-
-const OBSTACLE_LAYOUTS = [
-  // 布局 0：中央横墙 + 两侧竖柱 + 斜角掩体
-  [
-    { x: 360, y: 255, w: 180, h: 22 },  // 中央横向长条
-    { x: 240, y: 170, w: 22,  h: 130 }, // 左侧竖柱
-    { x: 660, y: 220, w: 22,  h: 130 }, // 右侧竖柱
-    { x: 480, y: 140, w: 140, h: 20 },  // 上方横条
-    { x: 420, y: 360, w: 140, h: 20 },  // 下方横条
-    { x: 300, y: 360, w: 80,  h: 20 },  // 左下短横
-  ],
-  // 布局 1：走廊型（上下各一道长墙，中间留缺口）
-  [
-    { x: 280, y: 145, w: 200, h: 20 },  // 上横墙左段
-    { x: 560, y: 145, w: 160, h: 20 },  // 上横墙右段
-    { x: 280, y: 375, w: 160, h: 20 },  // 下横墙左段
-    { x: 520, y: 375, w: 200, h: 20 },  // 下横墙右段
-    { x: 235, y: 220, w: 20,  h: 110 }, // 左竖柱
-    { x: 660, y: 210, w: 20,  h: 110 }, // 右竖柱
-    { x: 410, y: 245, w: 100, h: 20 },  // 中央横短条
-  ],
-  // 布局 2：分散长条（斜向交错）
-  // 注：中竖柱从 x=450 右移到 x=460，使其与左上横条(右端 x=430)间隙由 20px 扩至 30px，
-  // 满足 ally 膨胀半径 13px 后最小通道宽度 26px 的要求。
-  [
-    { x: 270, y: 160, w: 160, h: 20 },  // 左上横条（右端 x=430）
-    { x: 580, y: 200, w: 20,  h: 150 }, // 右侧竖条
-    { x: 340, y: 340, w: 160, h: 20 },  // 左下横条
-    { x: 630, y: 330, w: 140, h: 20 },  // 右下横条
-    { x: 240, y: 280, w: 20,  h: 100 }, // 左竖柱
-    { x: 460, y: 150, w: 20,  h: 120 }, // 中竖柱（间隙 460-430=30px ≥ 26px）
-  ],
-  // 布局 3：十字形 + 外围长条
-  [
-    { x: 390, y: 230, w: 120, h: 20 },  // 横臂
-    { x: 445, y: 165, w: 20,  h: 140 }, // 竖臂
-    { x: 240, y: 155, w: 130, h: 20 },  // 左上横
-    { x: 620, y: 155, w: 130, h: 20 },  // 右上横
-    { x: 240, y: 365, w: 130, h: 20 },  // 左下横
-    { x: 620, y: 365, w: 130, h: 20 },  // 右下横
-  ],
-];
+// ── 障碍物（布局见 obstacles/layouts.js，碰撞盒不变）────────────────────────────
 
 // assault APPROACH 阶段的 A* 导航栅格（障碍物变更时重建）
 let _navGrid = null;
 
 function generateObstacles() {
-  const idx = (state.floor - 1) % OBSTACLE_LAYOUTS.length;
-  state.obstacles = OBSTACLE_LAYOUTS[idx];
-  // 障碍物按 ally 半径膨胀后栅格化；用真实可走画布尺寸(960×540)
+  state.obstacles = window.GameObstacles.getForFloor(state.floor);
   _navGrid = buildNavGrid(state.obstacles, state.ally.radius, canvas.width, canvas.height);
 }
 
@@ -752,18 +724,76 @@ function findNearestEnemy(from) {
   return [nearest, minDist];
 }
 
+function gameInputBlocked() {
+  return !!state.result || state.floorState === "blessing_pick";
+}
+
+function findTargetForAlly() {
+  const now = performance.now() / 1000;
+  if (state.ally.focusMode === "lowest_hp" && state.ally.focusUntil > now) {
+    let low = null;
+    state.enemies.forEach((e) => {
+      if (!low || e.hp < low.hp) low = e;
+    });
+    if (low) return low;
+  }
+  const [nearest] = findNearestEnemy(state.ally);
+  return nearest;
+}
+
+function showBlessingPick() {
+  state.floorState = "blessing_pick";
+  state.blessingChoices = window.GameBlessings.pickThree();
+  const overlay = document.getElementById("blessingOverlay");
+  const container = document.getElementById("blessingChoices");
+  if (!overlay || !container) {
+    state.floorState = "clear";
+    state.transitionTimer = 2.5;
+    return;
+  }
+  container.innerHTML = "";
+  state.blessingChoices.forEach((b, i) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "blessing-card";
+    btn.innerHTML = `<strong>${b.name}</strong><span>${b.desc}</span>`;
+    btn.addEventListener("click", () => pickBlessing(i));
+    container.appendChild(btn);
+  });
+  overlay.classList.remove("hidden");
+}
+
+function pickBlessing(idx) {
+  const b = state.blessingChoices[idx];
+  if (b) window.GameBlessings.apply(state, b);
+  const overlay = document.getElementById("blessingOverlay");
+  if (overlay) overlay.classList.add("hidden");
+  state.floorState = "clear";
+  state.transitionTimer = 2.5;
+  npcPushEvent("floor_clear", { floor: state.floor });
+  setAllyBubble(b ? `狱印「${b.name}」已铭刻，下一层见。` : "下一层见。");
+}
+
 // ── 游戏逻辑更新 ──────────────────────────────────────────────────────────────
 
 function removeDeadEnemies() {
-  const kills = state.enemies.filter((e) => e.hp <= 0).length;
-  if (kills > 0) npcPushEvent("kill", { count: kills });
+  const dead = state.enemies.filter((e) => e.hp <= 0);
+  if (dead.length > 0) {
+    dead.forEach((e) => {
+      window.GameFx.burst(e.x, e.y, e.kind === "boss" ? "#ffaa88" : "#ffb366", e.kind === "boss" ? 14 : 7);
+      if (e.kind === "boss") window.GameFx.shake(5, 0.18);
+    });
+    state.combo += dead.length;
+    state.comboTimer = 2.2;
+    state.maxCombo = Math.max(state.maxCombo, state.combo);
+    window.GameFx.floatText(state.player.x, state.player.y - 28, `+${dead.length} 连击 ${state.combo}`, "#ffe08a");
+    npcPushEvent("kill", { count: dead.length });
+  }
   state.enemies = state.enemies.filter((e) => e.hp > 0);
   state.bossAlive = state.enemies.some((e) => e.kind === "boss");
   if (state.enemies.length === 0 && state.floorState === "playing" && !state.result) {
-    state.floorState = "clear";
-    state.transitionTimer = 3.0;
-    npcPushEvent("floor_clear", { floor: state.floor });
-    setAllyBubble(`第 ${state.floor} 层清除！稍作准备，下一层马上来。`);
+    showBlessingPick();
+    setAllyBubble(`第 ${state.floor} 层清除！挑一枚狱印再走。`);
   }
 }
 
@@ -773,16 +803,34 @@ function createBullet(owner, from, to, speed, damage) {
 }
 
 function playerAttack() {
-  if (state.player.attackCd > 0 || state.result || state.floorState === "clear") return;
+  if (state.player.attackCd > 0 || gameInputBlocked() || state.floorState === "clear") return;
   const [target] = findNearestEnemy(state.player);
   if (!target) return;
+  const dmg = Math.max(1, Math.round(18 * (state.playerDamageMul || 1)));
   state.player.attackCd = 0.3;
-  state.playerBullets.push(createBullet("player", state.player, target, 430, 18));
+  state.playerBullets.push(createBullet("player", state.player, target, 430, dmg));
+  npcMarkPlayerAction();
+}
+
+function tryPlayerDash() {
+  if (state.player.dashCd > 0 || gameInputBlocked() || state.floorState === "clear") return;
+  let dx = 0;
+  let dy = 0;
+  if (state.keys.ArrowUp || state.keys.KeyW) dy -= 1;
+  if (state.keys.ArrowDown || state.keys.KeyS) dy += 1;
+  if (state.keys.ArrowLeft || state.keys.KeyA) dx -= 1;
+  if (state.keys.ArrowRight || state.keys.KeyD) dx += 1;
+  const [nx, ny] = normalize(dx || 1, dy);
+  const burst = state.player.speed * 0.55;
+  moveWithCollision(state.player, nx * burst, ny * burst);
+  state.player.dashCd = 1.1 * (state.dashCdMul || 1);
+  state.player.dashInvuln = 0.16;
   npcMarkPlayerAction();
 }
 
 function updatePlayer(dt) {
   if (state.result) return;
+  if (gameInputBlocked()) return;
   let dx = 0;
   let dy = 0;
   if (state.keys.ArrowUp    || state.keys.KeyW) dy -= 1;
@@ -795,6 +843,12 @@ function updatePlayer(dt) {
   moveWithCollision(state.player, nx * state.player.speed * dt, ny * state.player.speed * dt);
   state.player.attackCd = Math.max(0, state.player.attackCd - dt);
   state.player.shieldCd = Math.max(0, state.player.shieldCd - dt);
+  state.player.dashCd = Math.max(0, state.player.dashCd - dt);
+  state.player.dashInvuln = Math.max(0, state.player.dashInvuln - dt);
+  if (state.comboTimer > 0) {
+    state.comboTimer -= dt;
+    if (state.comboTimer <= 0) state.combo = 0;
+  }
 }
 
 function allyConfig() {
@@ -855,7 +909,7 @@ function updateAlly(dt) {
       const [nx, ny] = normalize(state.player.x - state.ally.x, state.player.y - state.ally.y);
       moveWithCollision(state.ally, nx * speed * dt, ny * speed * dt);
     }
-    const [target] = findNearestEnemy(state.ally);
+    const target = findTargetForAlly();
     if (target && state.ally.attackCd <= 0) {
       state.allyBullets.push(createBullet("ally", state.ally, target, 380, cfg.damage));
       state.ally.attackCd = cfg.interval;
@@ -930,17 +984,18 @@ function updateAlly(dt) {
 
   if (state.player.hp <= 45 && state.ally.rescueCd <= 0 && state.ally.stance !== "assault") {
     state.player.hp = Math.min(state.player.maxHp, state.player.hp + 28);
-    state.player.shieldCd = 2.2;
+    state.player.shieldCd = 2.2 * (state.blessingShieldMul || 1);
     state.ally.rescueCd = 9.0;
     setAllyBubble("先后撤，我给你护盾。");
   }
 }
 
 function updateEnemies(dt) {
-  if (state.floorState === "clear") return;
+  if (state.floorState !== "playing") return;
   state.enemies.forEach((enemy) => {
     enemy.shootCd = Math.max(0, enemy.shootCd - dt);
     if (state.result) return;
+    if (window.GameBullets.tickWarn(enemy, dt)) return;
 
     const distToPlayer = distance(enemy, state.player);
     const distToAlly = state.ally.hp > 0 ? distance(enemy, state.ally) : Number.POSITIVE_INFINITY;
@@ -949,10 +1004,21 @@ function updateEnemies(dt) {
     moveWithCollision(enemy, nx * enemy.speed * dt, ny * enemy.speed * dt);
 
     if (enemy.shootCd <= 0) {
-      const bulletSpeed  = enemy.kind === "boss" ? 200 : 170;
-      const bulletDamage = enemy.kind === "boss" ? 9   : 5;
-      state.enemyBullets.push(createBullet("enemy", enemy, primary, bulletSpeed, bulletDamage));
-      enemy.shootCd = enemy.kind === "boss" ? 1.2 : 1.6;
+      const bulletSpeed = enemy.kind === "boss" ? 200 : 170;
+      const bulletDamage = enemy.kind === "boss" ? 9 : 5;
+      if (enemy.kind === "boss" && Math.random() < 0.38) {
+        window.GameBullets.startWarn(enemy, 0.45);
+        enemy._pendingFan = { primary, bulletSpeed, bulletDamage };
+        enemy.shootCd = 0.5;
+      } else {
+        window.GameBullets.aimedShot(state.enemyBullets, enemy, primary, bulletSpeed, bulletDamage);
+        enemy.shootCd = enemy.kind === "boss" ? 1.2 : 1.6;
+      }
+    } else if (enemy._pendingFan && !enemy.warnT) {
+      const p = enemy._pendingFan;
+      window.GameBullets.fanShot(state.enemyBullets, enemy, p.primary, p.bulletSpeed, p.bulletDamage, 42, 5);
+      enemy._pendingFan = null;
+      enemy.shootCd = 1.35;
     }
   });
 }
@@ -983,7 +1049,13 @@ function updateBullets(dt) {
     let hit = false;
     for (let j = 0; j < state.enemies.length; j += 1) {
       const e = state.enemies[j];
-      if (distance(b, e) <= b.radius + e.radius) { e.hp -= b.damage; hit = true; break; }
+      if (distance(b, e) <= b.radius + e.radius) {
+        e.hp -= b.damage;
+        window.GameFx.burst(b.x, b.y, "#6bc8ff", 4);
+        window.GameFx.floatText(e.x, e.y - 18, String(b.damage), "#9fe4ff");
+        hit = true;
+        break;
+      }
     }
     if (hit) state.playerBullets.splice(i, 1);
   }
@@ -993,7 +1065,12 @@ function updateBullets(dt) {
     let hit = false;
     for (let j = 0; j < state.enemies.length; j += 1) {
       const e = state.enemies[j];
-      if (distance(b, e) <= b.radius + e.radius) { e.hp -= b.damage; hit = true; break; }
+      if (distance(b, e) <= b.radius + e.radius) {
+        e.hp -= b.damage;
+        window.GameFx.burst(b.x, b.y, "#9af19b", 4);
+        hit = true;
+        break;
+      }
     }
     if (hit) state.allyBullets.splice(i, 1);
   }
@@ -1002,9 +1079,16 @@ function updateBullets(dt) {
     const b = state.enemyBullets[i];
     let consumed = false;
     if (distance(b, state.player) <= b.radius + state.player.radius) {
-      const raw = b.damage;
-      const final = state.player.shieldCd > 0 ? Math.max(2, Math.floor(raw * 0.3)) : raw;
-      state.player.hp -= final;
+      if (state.player.dashInvuln <= 0) {
+        const raw = b.damage;
+        const guardNear = state.ally.stance === "guard" && !state.ally.dead
+          && distance(state.ally, state.player) <= 80;
+        let final = raw;
+        if (state.player.shieldCd > 0) final = Math.max(2, Math.floor(raw * 0.3));
+        else if (guardNear) final = Math.max(2, Math.floor(raw * (1 - (state.guardDamageReduction || 0.15))));
+        state.player.hp -= final;
+        window.GameFx.shake(2.5, 0.08);
+      }
       consumed = true;
     } else if (state.ally.hp > 0 && distance(b, state.ally) <= b.radius + state.ally.radius) {
       state.ally.hp -= b.damage;
@@ -1015,7 +1099,7 @@ function updateBullets(dt) {
 }
 
 function checkDefeat() {
-  if (state.result || state.floorState === "clear") return;
+  if (state.result || state.floorState === "clear" || state.floorState === "blessing_pick") return;
   if (state.player.hp <= 0) {
     state.player.hp = 0;
     state.result = `战败。坚持到了第 ${state.floor} 层。`;
@@ -1094,16 +1178,7 @@ function drawBackground(dt) {
 
 function drawObstacles() {
   const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
-  state.obstacles.forEach((o) => {
-    ctx.fillStyle = `${meta.haze}dd`;
-    ctx.fillRect(o.x, o.y, o.w, o.h);
-    ctx.strokeStyle = `${meta.accent}aa`;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(o.x, o.y, o.w, o.h);
-    ctx.fillStyle = `${meta.accent}22`;
-    ctx.fillRect(o.x + 6, o.y + 6, o.w - 12, 6);
-    ctx.lineWidth = 1;
-  });
+  window.GameObstacles.draw(ctx, state.obstacles, meta);
 }
 
 function drawPixelSprite(entity, palette, dir = 1) {
@@ -1159,18 +1234,56 @@ function drawPixelSprite(entity, palette, dir = 1) {
 
 function drawBullets() {
   const drawSet = (arr, color) => {
-    ctx.fillStyle = color;
     arr.forEach((b) => {
-      const x = Math.floor(b.x);
-      const y = Math.floor(b.y);
-      ctx.fillRect(x - 1, y - 1, 3, 3);
-      ctx.fillRect(x - 2, y, 1, 1);
-      ctx.fillRect(x + 2, y, 1, 1);
+      const c = b.color || color;
+      ctx.fillStyle = `${c}55`;
+      ctx.fillRect(b.x - b.vx * 0.02 - 2, b.y - b.vy * 0.02 - 2, 4, 4);
+      ctx.fillStyle = c;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.radius || 3, 0, Math.PI * 2);
+      ctx.fill();
     });
   };
   drawSet(state.playerBullets, "#6bc8ff");
-  drawSet(state.allyBullets,   "#9af19b");
-  drawSet(state.enemyBullets,  "#ff9f83");
+  drawSet(state.allyBullets, "#9af19b");
+  drawSet(state.enemyBullets, "#ff6e58");
+}
+
+function drawCombatFx() {
+  state.enemies.forEach((e) => {
+    if (e.warnT > 0) {
+      ctx.strokeStyle = `rgba(255, 120, 90, ${0.35 + Math.sin(performance.now() / 80) * 0.25})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.radius + 16, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+  });
+  if (state.player.shieldCd > 0) {
+    ctx.strokeStyle = "rgba(120, 200, 255, 0.75)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(state.player.x, state.player.y, state.player.radius + 6, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.player.dashInvuln > 0) {
+    ctx.strokeStyle = "rgba(255, 240, 160, 0.8)";
+    ctx.beginPath();
+    ctx.arc(state.player.x, state.player.y, state.player.radius + 4, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.ally.stance === "guard" && state.ally.hp > 0) {
+    ctx.strokeStyle = "rgba(180, 255, 170, 0.35)";
+    ctx.beginPath();
+    ctx.arc(state.ally.x, state.ally.y, state.ally.radius + 8, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (state.ally.stance === "assault" && state.ally.hp > 0) {
+    ctx.strokeStyle = "rgba(255, 170, 110, 0.45)";
+    ctx.beginPath();
+    ctx.arc(state.ally.x, state.ally.y, state.ally.radius + 10, 0, Math.PI * 2);
+    ctx.stroke();
+  }
 }
 
 function drawAllyBubble() {
@@ -1200,17 +1313,22 @@ function drawOverlay() {
   ctx.fillText(`狱律提示：${meta.hint}`, 16, 46);
 
   if (state.floorState === "clear") {
-    ctx.fillStyle = "rgba(6, 8, 12, 0.70)";
+    ctx.fillStyle = "rgba(6, 8, 12, 0.55)";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = "#ecf1ff";
-    ctx.font = "bold 26px Segoe UI";
+    ctx.font = "bold 22px Segoe UI";
     ctx.textAlign = "center";
     ctx.fillText(
-      `第 ${state.floor} 层清除！${Math.ceil(state.transitionTimer)} 秒后进入下一层…`,
+      `${Math.ceil(state.transitionTimer)} 秒后进入下一层…`,
       canvas.width / 2,
       canvas.height / 2,
     );
     ctx.textAlign = "left";
+  }
+  if (state.combo > 1) {
+    ctx.fillStyle = "#ffe6a0";
+    ctx.font = "bold 14px Segoe UI";
+    ctx.fillText(`连击 ×${state.combo}`, canvas.width - 110, 24);
   }
   if (state.result) {
     ctx.fillStyle = "rgba(6, 8, 12, 0.65)";
@@ -1224,6 +1342,8 @@ function drawOverlay() {
 }
 
 function render(dt) {
+  ctx.save();
+  window.GameFx.applyShake(ctx);
   drawBackground(dt);
   drawObstacles();
   drawPixelSprite(state.player, { outline: "#1f2f39", skin: "#e1bfa1", eye: "#6ec4ff", cloth: "#3f86c2", trim: "#9fe4ff", hp: "#8dd0ff" }, 1);
@@ -1238,8 +1358,11 @@ function render(dt) {
     );
   });
   drawBullets();
+  drawCombatFx();
+  window.GameFx.draw(ctx);
   drawAllyBubble();
   drawOverlay();
+  ctx.restore();
 }
 
 function updateHud() {
@@ -1262,8 +1385,11 @@ function updateHud() {
     }
   }
 
+  const comboTag = state.combo > 1 ? ` | 连击 ${state.combo}` : "";
   hudStats.textContent =
-    `${floorName}（第 ${state.floor} 层） | 玩家 HP ${Math.floor(state.player.hp)} | 乌枭 HP ${Math.floor(state.ally.hp)} | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}`;
+    `${floorName}（第 ${state.floor} 层） | 玩家 HP ${Math.floor(state.player.hp)}/${state.player.maxHp}`
+    + ` | 乌枭 HP ${Math.floor(state.ally.hp)}/${state.ally.maxHp}`
+    + ` | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}${comboTag}`;
 }
 
 // ── NPC 对话与自主思考 ────────────────────────────────────────────────────────
@@ -1780,6 +1906,7 @@ function loop(ts) {
   removeDeadEnemies();
   checkDefeat();
   updateFloorTransition(dt);
+  window.GameFx.update(dt);
   render(dt);
   updateHud();
   requestAnimationFrame(loop);
@@ -1793,6 +1920,10 @@ document.addEventListener("keydown", (e) => {
   }
   state.keys[e.code] = true;
   if (e.code === "Space") { e.preventDefault(); playerAttack(); }
+  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+    e.preventDefault();
+    tryPlayerDash();
+  }
 });
 document.addEventListener("keyup", (e) => { state.keys[e.code] = false; });
 
@@ -1807,6 +1938,6 @@ chatForm.addEventListener("submit", async (e) => {
 
 appendMessage("npc", "黑签鬼差乌枭到位。你别乱送，我就能把你带到无间边狱。");
 npcInitAutonomy();
-console.info(`[NPC] autonomy9 loaded — assault rules + tactical context`);
+console.info(`[NPC] autonomy9 + game ${GAME_BUILD} (safe upgrades, RL frozen)`);
 setInterval(npcTickAutonomy, 1000);
 requestAnimationFrame(loop);
