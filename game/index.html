@@ -3,8 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
     <title>AI Roguelite 网页演示</title>
-    <link rel="stylesheet" href="styles.css?v=chat_scroll" />
+    <link rel="stylesheet" href="styles.css?v=skill1" />
   </head>
   <body>
     <div class="layout">
@@ -12,8 +13,9 @@
         <div class="lore-banner">
           <h1>《无间行录》：十八狱镇压行动</h1>
           <p>
-            你是“阳差未绝”的魂体，坠入失序阴司。每层有多间狱房——清怪开门、往前探索，尽头镇压 Boss 后择狱印。
-            你身边的鬼差“乌枭”嘴臭但懂规矩，别被他骂走神了。
+            你是“阳差未绝”的魂体，坠入失序阴司。清怪开门、择狱印；
+            <strong>第2间为裂狱并行</strong>（左右分场，两边清完才开门）。
+            对话改乌枭姿态（守护/突击）。主动技能装在技能槽，按 <strong>1</strong> 释放（默认契印连携：贴枭攒条后齐攻）。
           </p>
         </div>
         <div class="canvas-wrap">
@@ -27,7 +29,7 @@
         <div class="hud">
           <div id="hudStats"></div>
           <p class="tips">
-            移动：WASD/方向键 | 射击：空格 | 闪避：Shift | 清房后靠右侧门前进 | 对话控制乌枭
+            移动：WASD | 射击：空格 | 闪避：Shift | 技能：1 | 姿态对话：守护/突击 | 清房后靠右门
           </p>
         </div>
       </section>
@@ -42,28 +44,30 @@
         <h2>鬼差同盟 · 乌枭</h2>
         <div id="chatLog" class="chat-log"></div>
         <form id="chatForm">
-          <input id="chatInput" autocomplete="off" maxlength="160" placeholder="输入战术指令（例如：守护我 / 去突击）..." />
+          <input id="chatInput" autocomplete="off" maxlength="160" placeholder="姿态：守护我 / 突击..." />
           <button type="submit">发送</button>
         </form>
       </aside>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
-    <script src="pathfinding.js"></script>
-    <script src="obstacles/layouts.js"></script>
-    <script src="dungeon/roomLayouts.js"></script>
-    <script src="dungeon/generator.js"></script>
-    <script src="dungeon/minimap.js"></script>
-    <script src="dungeon/doorTransition.js"></script>
-    <script src="combat/shooting.js"></script>
-    <script src="combat/hazards.js"></script>
-    <script src="enemies/eliteRegistry.js"></script>
-    <script src="enemies/abilities.js"></script>
-    <script src="bosses/registry.js"></script>
-    <script src="bosses/patterns.js"></script>
-    <script src="fx.js"></script>
-    <script src="bullets/patterns.js"></script>
-    <script src="meta/blessings.js"></script>
-    <script src="game.js?v=m1_guard_nav1"></script>
+    <script src="pathfinding.js?v=skill1"></script>
+    <script src="obstacles/layouts.js?v=skill1"></script>
+    <script src="dungeon/roomLayouts.js?v=skill1"></script>
+    <script src="dungeon/generator.js?v=skill1"></script>
+    <script src="dungeon/minimap.js?v=skill1"></script>
+    <script src="dungeon/doorTransition.js?v=skill1"></script>
+    <script src="combat/shooting.js?v=skill1"></script>
+    <script src="combat/hazards.js?v=skill1"></script>
+    <script src="enemies/eliteRegistry.js?v=skill1"></script>
+    <script src="enemies/abilities.js?v=skill1"></script>
+    <script src="bosses/registry.js?v=skill1"></script>
+    <script src="bosses/patterns.js?v=skill1"></script>
+    <script src="fx.js?v=skill1"></script>
+    <script src="bullets/patterns.js?v=skill1"></script>
+    <script src="meta/blessings.js?v=skill1"></script>
+    <script src="coop/coop.js?v=skill1"></script>
+    <script src="skills/registry.js?v=skill1"></script>
+    <script src="game.js?v=skill1"></script>
   </body>
 </html>

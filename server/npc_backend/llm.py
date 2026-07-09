@@ -154,18 +154,29 @@ def autonomous_decide(
 
 _GUARD_HINTS = ("守护我", "跟着我", "贴着我", "别乱跑", "回来", "护着我", "守住", "守护")
 _ASSAULT_HINTS = ("突击", "冲上去", "开路", "压制", "上去打", "前锋", "进攻", "去突击")
+_INFO_HINTS = ("顺序", "怎么点", "报一下", "哪根柱")
 
 
 def fast_command_intent(
     message: str,
     scene_info: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """短句战术指令快路径，跳过意图分类 LLM；确认语带场面槽位。"""
+    """短句战术指令快路径：仅姿态；技能不走对话。"""
     text = message.strip()
-    if not text or len(text) > 24:
+    if not text or len(text) > 28:
         return None
     scene_info = scene_info or {}
     current = str(scene_info.get("ally_stance", "") or "")
+
+    # 判词报点：规则真值，禁止幻觉
+    if scene_info.get("info_active") and any(h in text for h in _INFO_HINTS):
+        report = str(scene_info.get("info_report") or "").strip()
+        if report:
+            return {
+                "type": "dialogue",
+                "reply": f"听好了——{report}",
+            }
+
     for hint in _GUARD_HINTS:
         if hint in text:
             same = current == "guard"

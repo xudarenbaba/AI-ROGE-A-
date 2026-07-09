@@ -1,6 +1,6 @@
 const NPC_API = "http://127.0.0.1:5100";
 const NPC_AUTONOMY_BUILD = "autonomy10";
-const GAME_BUILD = "m1_autonomy10";
+const GAME_BUILD = "skill1";
 
 // ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
 // onnxruntime-web 从 CDN 加载；如需离线部署可改为本地路径。
@@ -608,7 +608,12 @@ const state = {
   hazards: [],
   _combatScale: null,
   cinders: [],
+  coop: null,
+  skillSlot: null,
 };
+
+if (window.GameCoop) state.coop = window.GameCoop.defaultCoop();
+if (window.GameSkills) window.GameSkills.ensureSlot(state);
 
 // ── 关卡配置 ──────────────────────────────────────────────────────────────────
 
@@ -892,6 +897,42 @@ function loadRoom(index) {
   state.roomCleared = false;
   room.cleared = false;
   state.dungeon.maxRoomIndex = Math.max(state.dungeon.maxRoomIndex ?? 0, index);
+
+  // 协同房：分房 / 判词 / 代行（在 spawnRoomEnemies 之后）
+  state._doorGraceT = 0;
+  if (window.GameCoop) {
+    const coopHelpers = {
+      setBubble: setAllyBubble,
+      chat: (text) => appendMessage("npc", text),
+      // 乌枭侧清完：推事件并触发一次自主思考（可能说句更自然的话）
+      onAllySideClear: (info) => {
+        npcPushEvent("coop_ally_clear", {
+          player_done: !!(info && info.playerDone),
+        });
+        // 稍延迟，让气泡先出，再走 LLM think
+        setTimeout(() => {
+          if (state.floorState !== "playing" || state.result) return;
+          npcEnqueueThink({
+            priority: 1,
+            trigger: "scene_change",
+            reason: "coop_ally_clear",
+            scene_change_kind: "coop_ally_clear",
+          });
+        }, 400);
+      },
+    };
+    if (room.type === "duo_split" || room.coop === "split") {
+      window.GameCoop.enterSplitMirror(state, room, coopHelpers);
+    } else {
+      window.GameCoop.resetRoom(state);
+      if (room.type === "duo_info" || room.coop === "info") {
+        window.GameCoop.enterInfoRoom(state, coopHelpers);
+      } else if (room.type === "duo_proxy" || room.coop === "proxy") {
+        window.GameCoop.enterProxy(state, coopHelpers);
+      }
+    }
+  }
+
   if (index > 0) {
     npcPurgeEvents("room_cleared", "floor_clear");
     npcIO.abortCtrl?.abort();
@@ -904,6 +945,10 @@ function loadRoom(index) {
     setAllyBubble(`${meta.name} · ${bm.name}：${bm.ult}预备。`);
   } else if (room.type === "entrance") {
     setAllyBubble(`第 ${state.floor} 层 ${meta.name}。清完再往前。`);
+  } else if (room.type === "duo_split") {
+    /* bubble set by GameCoop */
+  } else if (room.type === "duo_info" || room.type === "duo_proxy") {
+    /* bubble set by GameCoop */
   } else {
     setAllyBubble(`${room.label}。清完开门。`);
   }
@@ -915,14 +960,35 @@ function initFloorDungeon() {
   state.hazards = [];
   state.doorTransitionTimer = 0;
   state.renderSlide = 0;
+  const roomSummary = (state.dungeon.rooms || [])
+    .map((r, i) => `${i}:${r.type}/${r.label}`)
+    .join(" → ");
+  console.info("[DUNGEON] floor", state.floor, roomSummary);
+  if (!(state.dungeon.rooms || []).some((r) => r.type === "duo_split" || r.coop === "split")) {
+    console.warn("[DUNGEON] 本层没有裂狱房！generator.js 可能是旧缓存。硬刷新或重启 run_game.py");
+  }
   loadRoom(0);
 }
 
 function onRoomCleared() {
   const room = currentRoom();
   if (!room || state.roomCleared) return;
+  // 协同门禁：分房须双边完成；判词须解谜
+  if (window.GameCoop && !window.GameCoop.roomClearGate(state)) return;
   room.cleared = true;
   state.roomCleared = true;
+  const settle = window.GameCoop?.settleRoom?.(state, {
+    setBubble: setAllyBubble,
+    chat: (t) => appendMessage("npc", t),
+  });
+  if (settle) {
+    setAllyBubble(
+      settle.score >= 75
+        ? `配合还行。门开了，靠右门前进。`
+        : `门开了，靠右门前进。`,
+    );
+    appendMessage("npc", "【门已开】走到右侧发光门即可进入下一间。");
+  }
   if (room.boss) {
     showBlessingPick();
     setAllyBubble("本层首领已灭。择狱印后继续。");
@@ -940,16 +1006,31 @@ function onRoomCleared() {
 function tryEnterDoor() {
   if (!state.roomCleared || state.floorState !== "playing" || state.result) return;
   if (state.enemies.length > 0) return;
+  // 清房后短时禁止自动进门
+  if ((state._doorGraceT || 0) > 0) return;
+  // 裂狱等：必须主动按 →/D 才进门，防止站在门边自动切房
+  if (state._doorNeedsRightKey) {
+    if (!(state.keys.ArrowRight || state.keys.KeyD)) return;
+  }
   const room = currentRoom();
   if (!room || room.index >= state.dungeon.rooms.length - 1) return;
+  // 分房未双边完成时绝不进门（双保险）
+  if ((room.type === "duo_split" || room.coop === "split")
+      && window.GameCoop && !window.GameCoop.roomClearGate(state)
+      && !state.coop?._splitCompleted) {
+    return;
+  }
   const door = window.GameRoomLayouts.getDoorRect(canvas.width, canvas.height);
   const p = state.player;
   const nearX = Math.max(door.x, Math.min(p.x, door.x + door.w));
   const nearY = Math.max(door.y, Math.min(p.y, door.y + door.h));
-  if (Math.hypot(p.x - nearX, p.y - nearY) >= p.radius) return;
+  // 必须深入门区
+  if (Math.hypot(p.x - nearX, p.y - nearY) > 8) return;
   const nextRoom = state.dungeon.rooms[state.roomIndex + 1];
   npcPurgeEvents("room_cleared");
   npcIO.abortCtrl?.abort();
+  state._doorNeedsRightKey = false;
+  state._doorGraceT = 0;
   state.floorState = "door_transition";
   state.renderSlide = 0;
   window.GameDoorTransition.start({
@@ -1325,11 +1406,20 @@ function removeDeadEnemies() {
     state.maxCombo = Math.max(state.maxCombo, state.combo);
     window.GameFx.floatText(state.player.x, state.player.y - 28, `+${dead.length} 连击 ${state.combo}`, "#ffe08a");
     npcPushEvent("kill", { count: dead.length });
+    window.GameCoop?.onPlayerKill?.(state, dead.length);
   }
   state.enemies = state.enemies.filter((e) => e.hp > 0);
   state.bossAlive = state.enemies.some((e) => e.kind === "boss");
-  if (state.enemies.length === 0 && state.floorState === "playing" && !state.result) {
-    onRoomCleared();
+  if (state.floorState === "playing" && !state.result && !state.roomCleared) {
+    const room = currentRoom();
+    // 裂狱房：禁止「只清玩家侧」就 onRoomCleared
+    if (room && (room.type === "duo_split" || room.coop === "split")) {
+      if (window.GameCoop?.roomClearGate?.(state)) onRoomCleared();
+    } else if (window.GameCoop) {
+      if (window.GameCoop.roomClearGate(state)) onRoomCleared();
+    } else if (state.enemies.length === 0) {
+      onRoomCleared();
+    }
   }
 }
 
@@ -1382,6 +1472,18 @@ function updatePlayer(dt) {
   const moving = nx !== 0 || ny !== 0;
   if (moving) npcMarkPlayerAction();
   moveWithCollision(state.player, nx * state.player.speed * dt, ny * state.player.speed * dt);
+  // 裂狱进行中：玩家锁右半场（门在右）；结束后可自由
+  if (window.GameCoop?.isSplit?.(state) && state.coop?.split?.active) {
+    const mid = state.coop.split.dividerX || 480;
+    if (state.player.x < mid + 18) state.player.x = mid + 18;
+    // 右半敌人只夹半场，不每帧硬拽（避免与 A* 打架站桩）；仅越界时纠正
+    (state.enemies || []).forEach((e) => {
+      if (e.hp <= 0) return;
+      e._splitSide = "player";
+      const r = e.radius || 12;
+      if (e.x < mid + r + 8) e.x = mid + r + 8;
+    });
+  }
   tickEntityStuckEscape(state.player, dt, {
     moving,
     speed: state.player.speed,
@@ -1392,6 +1494,7 @@ function updatePlayer(dt) {
   state.player.shieldCd = Math.max(0, state.player.shieldCd - dt);
   state.player.dashCd = Math.max(0, state.player.dashCd - dt);
   state.player.dashInvuln = Math.max(0, state.player.dashInvuln - dt);
+  if (state._doorGraceT > 0) state._doorGraceT -= dt;
   if (state.comboTimer > 0) {
     state.comboTimer -= dt;
     if (state.comboTimer <= 0) state.combo = 0;
@@ -1414,22 +1517,36 @@ function findEngagePoint(target, cfg) {
   const ally = state.ally;
   const lo = cfg.kiteRange + 5;
   const hi = cfg.attackRange * 0.95;
+  const split = isAllySplitCombat();
+  const mid = split ? (state.coop.split.dividerX || 480) : null;
   let best = null;
   let bestScore = Infinity;
   for (let i = 0; i < 16; i += 1) {
     const angle = (2 * Math.PI * i) / 16;
     for (const r of [lo, (lo + hi) * 0.5, hi]) {
-      const px = target.x + Math.cos(angle) * r;
-      const py = target.y + Math.sin(angle) * r;
+      let px = target.x + Math.cos(angle) * r;
+      let py = target.y + Math.sin(angle) * r;
+      if (split && mid != null) {
+        // 裂狱：交战点限制在左半场
+        px = Math.min(px, mid - ally.radius - 12);
+      }
       if (px < ally.radius || px > canvas.width - ally.radius) continue;
       if (py < ally.radius || py > canvas.height - ally.radius) continue;
+      if (split && mid != null && px >= mid - ally.radius) continue;
       if (collidesWithObstacle(px, py, ally.radius)) continue;
       if (!_rlHasLOS(px, py, target.x, target.y)) continue;
       const score = Math.hypot(px - ally.x, py - ally.y);
       if (score < bestScore) { bestScore = score; best = { x: px, y: py }; }
     }
   }
-  return best || { x: target.x, y: target.y };
+  if (best) return best;
+  if (split && mid != null) {
+    return {
+      x: Math.min(target.x, mid - ally.radius - 16),
+      y: target.y,
+    };
+  }
+  return { x: target.x, y: target.y };
 }
 
 function clearGuardNav(ally = state.ally) {
@@ -1589,15 +1706,48 @@ function maybeReplanNav(target, dt) {
   a.navPath = raw ? smoothPath(raw, allObstacles(), a.radius) : null;
 }
 
+function isAllySplitCombat() {
+  return !!(window.GameCoop?.isSplit?.(state) && state.coop?.split?.active);
+}
+
+/** 裂狱时把乌枭侧敌人/弹幕临时挂到 state，供 A* + RL 复用 */
+function withSplitAllyCombatContext(fn) {
+  if (!isAllySplitCombat()) return fn();
+  const s = state.coop.split;
+  const savedEnemies = state.enemies;
+  const savedEnemyBullets = state.enemyBullets;
+  state.enemies = s.allyEnemies || [];
+  state.enemyBullets = s.enemyBullets || [];
+  try {
+    return fn();
+  } finally {
+    // 保持数组引用写回（RL/击杀可能改列表内容；不替换引用）
+    if (state.enemies !== s.allyEnemies) s.allyEnemies = state.enemies;
+    if (state.enemyBullets !== s.enemyBullets) s.enemyBullets = state.enemyBullets;
+    state.enemies = savedEnemies;
+    state.enemyBullets = savedEnemyBullets;
+  }
+}
+
 function updateAlly(dt) {
   syncAllyLifeState({ announce: false });
+  if (allyIsDown()) return;
+
+  const split = isAllySplitCombat();
+  // 裂狱：强制突击，走正常 A* + RL（上下文切到左侧敌人）
+  if (split) {
+    if (state.ally.stance !== "assault") state.ally.stance = "assault";
+  }
+
+  withSplitAllyCombatContext(() => {
   const cfg = allyConfig();
   state.ally.attackCd = Math.max(0, state.ally.attackCd - dt);
   state.ally.rescueCd = Math.max(0, state.ally.rescueCd - dt);
   const speed = state.ally.speed * cfg.speedMul;
   let allyMoving = false;
 
-  if (state.ally.stance === "guard" || state.player.hp <= 40) {
+  // 裂狱不做守护贴玩家，只打左侧
+  if (!split && (state.ally.stance === "guard" || state.player.hp <= 40)) {
     const d = distance(state.ally, state.player);
     const chasing = shouldGuardFollow(d);
     if (chasing) {
@@ -1685,22 +1835,34 @@ function updateAlly(dt) {
 
       if (state.ally.attackCd <= 0) {
         if (canBulletShoot(state.ally, target, cfg.attackRange)) {
-          state.allyBullets.push(createBullet("ally", state.ally, target, 400, cfg.damage));
+          const b = createBullet("ally", state.ally, target, 400, cfg.damage);
+          if (split) b._splitSide = "ally";
+          state.allyBullets.push(b);
           state.ally.attackCd = cfg.interval;
         } else {
           state.ally.attackCd = window.GameShooting?.RETRY_CD ?? 0.25;
         }
       }
+    } else if (split) {
+      // 左侧暂时无目标：小范围游走，避免完全发呆
+      allyMoving = true;
+      state.ally.combatPhase = "approach";
     }
 
   }
 
   const allyR = state.ally.radius;
-  const allyMinX = window.GameRoomLayouts?.playerMinX?.(state.roomIndex, allyR) ?? 10;
-  state.ally.x = clampUnit(state.ally.x, allyMinX, canvas.width - allyR);
-  state.ally.y = clampUnit(state.ally.y, allyR, canvas.height - allyR);
+  if (split) {
+    const mid = state.coop.split.dividerX || 480;
+    state.ally.x = clampUnit(state.ally.x, allyR + 8, mid - allyR - 10);
+    state.ally.y = clampUnit(state.ally.y, allyR, canvas.height - allyR);
+  } else {
+    const allyMinX = window.GameRoomLayouts?.playerMinX?.(state.roomIndex, allyR) ?? 10;
+    state.ally.x = clampUnit(state.ally.x, allyMinX, canvas.width - allyR);
+    state.ally.y = clampUnit(state.ally.y, allyR, canvas.height - allyR);
+  }
 
-  if (state.player.hp <= 45 && state.ally.rescueCd <= 0 && state.ally.stance !== "assault") {
+  if (!split && state.player.hp <= 45 && state.ally.rescueCd <= 0 && state.ally.stance !== "assault") {
     state.player.hp = Math.min(state.player.maxHp, state.player.hp + 28);
     state.player.shieldCd = 2.2 * (state.blessingShieldMul || 1);
     state.ally.rescueCd = 9.0;
@@ -1716,6 +1878,7 @@ function updateAlly(dt) {
       bubble: "墙缝太窄，我挣脱出来了。",
     });
   }
+  }); // withSplitAllyCombatContext
 }
 
 function updateEnemies(dt) {
@@ -1723,9 +1886,27 @@ function updateEnemies(dt) {
   if (state.result) return;
   window.GameEnemyAI.tickCombatMotion?.(state, dt);
   window.GameEnemyAI.updateEliteRoomAnchors?.(state, dt, _enemyAIHelpers);
+  // 玩家侧（右半 / 同屏）
   state.enemies.forEach((enemy) => {
+    if (isAllySplitCombat()) enemy._splitSide = "player";
     window.GameEnemyAI.updateEnemyCombat(enemy, dt, state, _enemyAIHelpers);
   });
+  // 裂狱乌枭侧：复用完整敌 AI（含 A*），子弹写入左侧列表
+  if (isAllySplitCombat() && state.coop?.split) {
+    const s = state.coop.split;
+    const savedBullets = state.enemyBullets;
+    state.enemyBullets = s.enemyBullets || [];
+    try {
+      (s.allyEnemies || []).forEach((enemy) => {
+        if (enemy.hp <= 0) return;
+        enemy._splitSide = "ally";
+        window.GameEnemyAI.updateEnemyCombat(enemy, dt, state, _enemyAIHelpers);
+      });
+    } finally {
+      if (state.enemyBullets !== s.enemyBullets) s.enemyBullets = state.enemyBullets;
+      state.enemyBullets = savedBullets;
+    }
+  }
 }
 
 function updateBullets(dt) {
@@ -1769,11 +1950,18 @@ function updateBullets(dt) {
     if (hit) state.playerBullets.splice(i, 1);
   }
 
+  const split = isAllySplitCombat();
+  const allyTargets = split
+    ? (state.coop.split.allyEnemies || [])
+    : state.enemies;
+
   for (let i = state.allyBullets.length - 1; i >= 0; i -= 1) {
     const b = state.allyBullets[i];
     let hit = false;
-    for (let j = 0; j < state.enemies.length; j += 1) {
-      const e = state.enemies[j];
+    // 裂狱：乌枭子弹只打左侧列表；同屏打 state.enemies
+    for (let j = 0; j < allyTargets.length; j += 1) {
+      const e = allyTargets[j];
+      if (e.hp <= 0) continue;
       if (distance(b, e) <= b.radius + e.radius) {
         const dmg = damageToEnemy(e, b.damage);
         if (dmg > 0) {
@@ -1794,16 +1982,17 @@ function updateBullets(dt) {
     if (distance(b, state.player) <= b.radius + state.player.radius) {
       if (state.player.dashInvuln <= 0) {
         const raw = b.damage;
-        const guardNear = state.ally.stance === "guard" && state.ally.hp > 0
+        const guardNear = !split && state.ally.stance === "guard" && state.ally.hp > 0
           && distance(state.ally, state.player) <= 80;
         let final = raw;
         if (state.player.shieldCd > 0) final = Math.max(2, Math.floor(raw * 0.3));
         else if (guardNear) final = Math.max(2, Math.floor(raw * (1 - (state.guardDamageReduction || 0.15))));
         state.player.hp -= final;
-        window.GameFx.shake(2.5, 0.08);
+        if (final >= 12) window.GameFx.shake(1.2, 0.05);
       }
       consumed = true;
-    } else if (state.ally.hp > 0 && distance(b, state.ally) <= b.radius + state.ally.radius) {
+    } else if (!split && state.ally.hp > 0 && distance(b, state.ally) <= b.radius + state.ally.radius) {
+      // 同屏：主场敌弹可打乌枭；裂狱时乌枭只吃左侧 enemyBullets（在 coop.tick）
       state.ally.hp -= b.damage;
       consumed = true;
     }
@@ -1938,7 +2127,8 @@ function drawRoomExit() {
   const room = currentRoom();
   if (!room || room.index >= state.dungeon.rooms.length - 1) return;
   const door = window.GameRoomLayouts.getDoorRect(canvas.width, canvas.height);
-  const cleared = state.roomCleared && state.enemies.length === 0;
+  const coopOk = !window.GameCoop || window.GameCoop.roomClearGate(state);
+  const cleared = state.roomCleared && state.enemies.length === 0 && coopOk;
   const pulse = 0.4 + Math.sin(performance.now() / 140) * 0.2;
   const cx = door.x + door.w / 2;
   const cy = door.y + door.h / 2;
@@ -2269,6 +2459,8 @@ function render(dt) {
   window.GameFx.draw(ctx);
   drawAllyBubble();
   drawOverlay();
+  window.GameCoop?.drawOverlay?.(ctx, canvas, state);
+  window.GameSkills?.drawSlot?.(ctx, canvas, state);
   ctx.restore();
   if (state.floorState === "door_transition") {
     window.GameDoorTransition.draw(ctx, canvas.width, canvas.height);
@@ -2414,10 +2606,21 @@ function updateHud() {
     else if (state.enemies.length > 0) doorTag = ` | 剩余 ${state.enemies.length} 敌`;
     else doorTag = " | 门未开";
   }
+  let coopTag = "";
+  if (window.GameCoop && state.coop) {
+    const cf = window.GameCoop.sceneFields(state);
+    if (cf.coop_mode && cf.coop_mode !== "none") {
+      coopTag = ` | 协同:${cf.coop_room_tag || cf.coop_mode}`;
+      if (cf.split_active) {
+        coopTag += ` 你${Math.round(cf.split_player_progress * 100)}%/枭${Math.round(cf.split_ally_progress * 100)}%`;
+      }
+    }
+    coopTag += ` | 口令${cf.command_slots_left}/${cf.command_slots_max}`;
+  }
   hudStats.textContent =
     `${floorName}（第 ${state.floor} 层）${roomTag} | 玩家 HP ${Math.floor(state.player.hp)}/${state.player.maxHp}`
     + ` | 乌枭 HP ${Math.floor(state.ally.hp)}/${state.ally.maxHp}`
-    + ` | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}${doorTag}${scaleTag}${comboTag}`;
+    + ` | 姿态 ${stanceLabel}${rlTag} | 敌人 ${state.enemies.length}${doorTag}${scaleTag}${comboTag}${coopTag}`;
   updateStatsPanels();
 }
 
@@ -2474,6 +2677,8 @@ const NPC_EVENT_TTL_MS = {
   boss_spawn: 8000,
   kill: 3500,
   hp_drop: 4500,
+  coop_ally_clear: 8000,
+  coop_side_done: 6000,
   default: 12000,
 };
 
@@ -2762,7 +2967,8 @@ function buildSceneInfo(trigger = "reactive") {
   const blessSum = window.GameBlessings?.summarizeForNpc(state) || { total: 0, soul: [], ally: [], pact: [], tags: [] };
   const canSpeak = state.floorState !== "blessing_pick" && state.floorState !== "door_transition";
   const doorAvailable = !!(room && state.dungeon && !room.boss && room.index < state.dungeon.rooms.length - 1);
-  const doorOpen = !!(doorAvailable && state.roomCleared && state.enemies.length === 0);
+  const coopOk = !window.GameCoop || window.GameCoop.roomClearGate(state);
+  const doorOpen = !!(doorAvailable && state.roomCleared && state.enemies.length === 0 && coopOk);
   const hazardCtx = npcHazardContext();
 
   const scene = {
@@ -2831,6 +3037,9 @@ function buildSceneInfo(trigger = "reactive") {
   if (npcIO.blessingJustPicked) {
     scene.blessing_just_picked = { ...npcIO.blessingJustPicked };
   }
+  if (window.GameCoop) {
+    Object.assign(scene, window.GameCoop.sceneFields(state));
+  }
   return scene;
 }
 
@@ -2858,10 +3067,38 @@ function npcMarkSpeech() {
   npcIO.lastNpcSpeechAt = performance.now();
 }
 
+function applyTacticalCommand(cmd, opts = {}) {
+  if (!cmd || !window.GameCoop) return { ok: false, reason: "no_coop" };
+  const op = cmd.op || cmd.stance;
+  if (!op) return { ok: false, reason: "bad_op" };
+  // 技能不走对话；仅姿态
+
+  if (op === "guard" || op === "assault" || cmd.stance) {
+    const stance = cmd.stance || op;
+    const gate = opts.free ? { ok: true } : window.GameCoop.canSpendSlot(state, stance);
+    if (!gate.ok) {
+      const msg = gate.reason === "no_slots" ? "口令签用完了，下房刷新。" : "姿态指令冷却中。";
+      setAllyBubble(msg);
+      if (!opts.silent) appendMessage("npc", msg);
+      return { ok: false, reason: gate.reason };
+    }
+    if (!opts.free) window.GameCoop.spendSlot(state, stance, 3);
+    const reply = opts.reply || (stance === "guard"
+      ? "行，收拢了，你别乱跑。"
+      : "好嘞，我去前面撕。");
+    applyStance(stance, reply, opts);
+    state.coop.stats.ordersObeyed += 1;
+    return { ok: true, reply, stance };
+  }
+
+  return { ok: false, reason: "unknown" };
+}
+
 function applyStance(stance, reply, opts = {}) {
   if (!stance) return;
   syncAllyLifeState({ announce: false });
   if (stance === "assault" && allyIsDown()) return;
+  // 分房中禁止切回主画面混战逻辑冲突：允许切姿态但 assault 仍走 split 域
   const stanceChanged = opts.stanceChanged !== undefined
     ? opts.stanceChanged
     : state.ally.stance !== stance;
@@ -2951,10 +3188,17 @@ async function consumeNpcStream(body, opts = {}) {
         if (evt.intent) lastIntent = evt.intent;
         outcome = `command:${evt.stance}:${evt.reply || ""}`;
         showAutonomous(() => {
-          applyStance(evt.stance, evt.reply, {
-            autonomous: opts.source === "autonomous",
-            stanceChanged: evt.stance_changed !== false,
-          });
+          // 后端 command：自主不耗口令槽；玩家聊天路径已本地处理
+          const free = opts.source === "autonomous";
+          if (evt.ops && Array.isArray(evt.ops) && window.GameCoop) {
+            evt.ops.forEach((op) => applyTacticalCommand(op, { free, silent: true, reply: evt.reply }));
+          }
+          if (evt.stance) {
+            applyStance(evt.stance, evt.reply, {
+              autonomous: opts.source === "autonomous",
+              stanceChanged: evt.stance_changed !== false,
+            });
+          }
         }, evt.intent);
       } else if (evt.type === "delta") {
         if (!npcThinkResponseFresh(opts, lastIntent)) {
@@ -3058,6 +3302,15 @@ function npcEvaluateTriggers() {
       trigger: "scene_change",
       reason: "floor_clear",
       scene_change_kind: "floor_clear",
+    };
+  }
+
+  if (events.includes("coop_ally_clear") && state.floorState === "playing") {
+    return {
+      priority: 1,
+      trigger: "scene_change",
+      reason: "coop_ally_clear",
+      scene_change_kind: "coop_ally_clear",
     };
   }
 
@@ -3195,6 +3448,37 @@ function npcTickAutonomy() {
 
 async function sendPlayerChat(message) {
   npcIO.lastPlayerMsgAt = performance.now();
+
+  // 本地口令快路径（不耗后端也可执行）
+  const localCmd = window.GameCoop?.parseLocalCommand?.(message);
+  if (localCmd) {
+    // 判词房：问顺序
+    if (window.GameCoop?.isInfo?.(state)
+        && (message.includes("顺序") || message.includes("怎么点") || message.includes("报"))) {
+      const report = window.GameCoop.reportInfo(state);
+      if (report) {
+        appendMessage("npc", report);
+        setAllyBubble(report);
+        npcMarkSpeech();
+        return;
+      }
+    }
+    const result = applyTacticalCommand(localCmd, { free: false });
+    if (result.ok) return;
+    // 槽用尽时已提示，仍可走后端对话
+  }
+
+  // 判词查询（非口令）
+  if (window.GameCoop?.isInfo?.(state)
+      && (message.includes("顺序") || message.includes("怎么点") || message.includes("柱") || message.includes("报"))) {
+    const report = window.GameCoop.reportInfo(state);
+    if (report) {
+      appendMessage("npc", `听好了——${report}`);
+      setAllyBubble(report);
+      npcMarkSpeech();
+    }
+  }
+
   const ctrl = npcStartRequest("chat");
 
   const payload = {
@@ -3236,7 +3520,29 @@ function loop(ts) {
   updateAlly(dt);
   updateEnemies(dt);
   updateBullets(dt);
+  window.GameCoop?.tick?.(state, dt, {
+    setBubble: setAllyBubble,
+    chat: (text) => appendMessage("npc", text),
+    onAllySideClear: (info) => {
+      npcPushEvent("coop_ally_clear", { player_done: !!(info && info.playerDone) });
+      setTimeout(() => {
+        if (state.floorState !== "playing" || state.result) return;
+        npcEnqueueThink({
+          priority: 1,
+          trigger: "scene_change",
+          reason: "coop_ally_clear",
+          scene_change_kind: "coop_ally_clear",
+        });
+      }, 400);
+    },
+  });
+  window.GameSkills?.tickEquipped?.(state, dt);
   removeDeadEnemies();
+  // 分房/判词：乌枭侧或解谜完成后补一次清房检测
+  if (state.floorState === "playing" && !state.result && !state.roomCleared
+      && window.GameCoop?.roomClearGate?.(state)) {
+    onRoomCleared();
+  }
   checkDefeat();
   updateDoorTransition(dt);
   window.GameEnemyAI?.updateStatusEffects(state, dt);
@@ -3251,6 +3557,37 @@ function loop(ts) {
 
 // ── 输入 ──────────────────────────────────────────────────────────────────────
 
+function tryCastSkillKey(e) {
+  // 聊天输入中不抢 1
+  const tag = (document.activeElement && document.activeElement.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA") return false;
+  if (e.code !== "Digit1" && e.code !== "Numpad1") return false;
+  e.preventDefault();
+  if (!window.GameSkills) return true;
+  window.GameSkills.ensureSlot(state);
+  const r = window.GameSkills.tryCastEquipped(state, {
+    setBubble: setAllyBubble,
+    chat: (t) => appendMessage("npc", t),
+  });
+  if (!r.ok) {
+    const map = {
+      not_ready: "契印未满",
+      no_enemies: "没有敌人",
+      split: "裂狱中不可用",
+      "契印未满": "契印未满",
+      "裂狱中": "裂狱中不可用",
+      "冷却中": "技能冷却中",
+      "乌枭失联": "乌枭失联",
+      "非战斗": "非战斗状态",
+    };
+    const msg = map[r.reason] || r.reason || "无法释放";
+    window.GameFx?.floatText?.(state.player.x, state.player.y - 36, msg, "#ffccaa");
+  } else {
+    npcMarkSpeech();
+  }
+  return true;
+}
+
 document.addEventListener("keydown", (e) => {
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "KeyW", "KeyA", "KeyS", "KeyD"].includes(e.code)) {
     e.preventDefault();
@@ -3261,6 +3598,7 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     tryPlayerDash();
   }
+  tryCastSkillKey(e);
 });
 document.addEventListener("keyup", (e) => { state.keys[e.code] = false; });
 
@@ -3274,8 +3612,22 @@ chatForm.addEventListener("submit", async (e) => {
 });
 
 appendMessage("npc", "黑签鬼差乌枭到位。你别乱送，我就能把你带到无间边狱。");
+appendMessage(
+  "npc",
+  "【本局】清完前厅进第2间「裂狱并行」：左=乌枭，右=你（出口在最右），两边都清完才开门。"
+  + "对话改姿态（守护/突击）；技能槽按 1 释放（默认契印连携）。",
+);
 npcInitAutonomy();
 window.__npcPushEvent = npcPushEvent;
 console.info(`[NPC] ${NPC_AUTONOMY_BUILD} + game ${GAME_BUILD}`);
+if (!window.GameCoop) {
+  console.error("[COOP] GameCoop 未加载！检查 game/coop/coop.js 是否 404");
+} else {
+  console.info("[COOP] GameCoop ready");
+}
+if (window.GameDungeonGen) {
+  const preview = window.GameDungeonGen.generate(1).map((r) => r.type).join(",");
+  console.info("[DUNGEON] preview floor1 types:", preview);
+}
 setInterval(npcTickAutonomy, 800);
 requestAnimationFrame(loop);

@@ -100,11 +100,18 @@
     return keys[(floor + roomIndex) % keys.length];
   }
 
+  function layoutTypeOf(room) {
+    const t = room?.type || "";
+    if (t === "duo_split" || t === "duo_info" || t === "duo_proxy") return "combat";
+    return t;
+  }
+
   function getObstacles(room) {
     let key = room.layoutKey;
     if (!key) {
-      if (room.type === "combat") key = pickCombatLayout(room.floor || 1, room.index || 0);
-      else key = room.type;
+      const t = layoutTypeOf(room);
+      if (t === "combat") key = pickCombatLayout(room.floor || 1, room.index || 0);
+      else key = t;
     }
     const boxes = (LAYOUTS[key] || LAYOUTS.combat_a).map((b) => ({ ...b }));
     if ((room.depth || 0) >= 2 && DEPTH_EXTRAS[key]) {
@@ -130,7 +137,10 @@
 
   function getSpawnPoints(roomType, roomIndex) {
     const minX = roomIndex > 0 ? SPAWN_MIN_X : 100;
-    if (roomType === "boss") {
+    const t = (roomType === "duo_split" || roomType === "duo_info" || roomType === "duo_proxy")
+      ? "combat"
+      : roomType;
+    if (t === "boss") {
       return {
         player: { x: Math.max(minX, 140), y: 270 },
         ally: { x: Math.max(minX + 40, 180), y: 300 },

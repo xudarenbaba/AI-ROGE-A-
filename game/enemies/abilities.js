@@ -192,6 +192,11 @@
   }
 
   function primaryTarget(state, enemy) {
+    // 裂狱分房：强制各自半场目标，避免跨中线寻路被硬夹导致站桩
+    if (enemy._splitSide === "player") return state.player;
+    if (enemy._splitSide === "ally") {
+      return state.ally.hp > 0 ? state.ally : state.player;
+    }
     if (enemy.isGuard && state.ally.hp > 0 && Math.random() < 0.6) return state.ally;
     const dp = dist(enemy, state.player);
     const da = state.ally.hp > 0 ? dist(enemy, state.ally) : Infinity;
@@ -286,6 +291,13 @@
       [mx, my] = norm(target.x - enemy.x, target.y - enemy.y);
     }
     H.moveWithCollision(enemy, mx * spd, my * spd);
+    // 分房半场硬边界（与 coop SPLIT_X=480 对齐）
+    if (enemy._splitSide === "player" || enemy._splitSide === "ally") {
+      const mid = 480;
+      const r = enemy.radius || 12;
+      if (enemy._splitSide === "player" && enemy.x < mid + r + 8) enemy.x = mid + r + 8;
+      if (enemy._splitSide === "ally" && enemy.x > mid - r - 8) enemy.x = mid - r - 8;
+    }
   }
 
   function startDash(enemy, target, speed, duration, state) {

@@ -25,13 +25,19 @@
       const y = oy;
       const active = i === roomIndex;
       const done = r.cleared || i < roomIndex;
-      ctx.fillStyle = active ? "#d08050" : done ? "#5a6a58" : "#2a2228";
+      const isCoop = r.type === "duo_split" || r.type === "duo_info" || r.type === "duo_proxy"
+        || r.coop === "split" || r.coop === "info" || r.coop === "proxy";
+      ctx.fillStyle = active ? "#d08050" : done ? "#5a6a58" : isCoop ? "#3a3050" : "#2a2228";
       ctx.fillRect(x, y, boxW, boxH);
-      ctx.strokeStyle = active ? "#ffcc99" : "#6a5a52";
+      ctx.strokeStyle = active ? "#ffcc99" : isCoop ? "#b090ff" : "#6a5a52";
       ctx.strokeRect(x, y, boxW, boxH);
       if (r.boss) {
         ctx.fillStyle = "#ffaa88";
         ctx.fillRect(x + 8, y + 4, 6, 6);
+      } else if (isCoop) {
+        ctx.fillStyle = "#c8a0ff";
+        ctx.font = "bold 9px Segoe UI";
+        ctx.fillText("协", x + 5, y + 11);
       }
     });
   }

@@ -174,6 +174,42 @@ def build_salient_snapshot(
     if _boolish(scene_info.get("player_is_idle")) and mode != "chat":
         points.append((77, "你有点发呆，可能需要提醒"))
 
+    # 协同房
+    coop_mode = str(scene_info.get("coop_mode") or "").strip()
+    if coop_mode and coop_mode != "none":
+        tag = str(scene_info.get("coop_room_tag") or coop_mode)
+        points.append((96, f"协同房：{tag}"))
+        if _boolish(scene_info.get("split_active")):
+            pp = scene_info.get("split_player_progress", 0)
+            ap = scene_info.get("split_ally_progress", 0)
+            points.append((97, f"裂狱进度 你{int(float(pp or 0)*100)}% / 我{int(float(ap or 0)*100)}%"))
+            if _boolish(scene_info.get("split_player_done")) and not _boolish(
+                scene_info.get("split_ally_done")
+            ):
+                points.append((94, "你侧已清完，我还在打"))
+            if _boolish(scene_info.get("split_ally_done")) and not _boolish(
+                scene_info.get("split_player_done")
+            ):
+                points.append((98, "我左边已肃清，正在等你清右边；可嘲讽催促一句"))
+            if _boolish(scene_info.get("split_ally_done")) and _boolish(
+                scene_info.get("split_player_done")
+            ):
+                points.append((98, "裂狱两边都清完，催玩家走右边门"))
+        if _boolish(scene_info.get("info_active")) and not _boolish(
+            scene_info.get("info_solved")
+        ):
+            points.append((96, "判词分卷未解，顺序只有我清楚"))
+            rep = str(scene_info.get("info_report") or "").strip()
+            if rep:
+                points.append((91, f"正确顺序：{rep}"))
+        if _boolish(scene_info.get("proxy_active")):
+            points.append((95, "代行房：你缄言，我靠你指挥输出"))
+        slots = scene_info.get("command_slots_left")
+        if slots is not None:
+            points.append((58, f"口令剩余{slots}/{scene_info.get('command_slots_max', '?')}"))
+        if _boolish(scene_info.get("combo_window")):
+            points.append((80, "契印连携窗口已开"))
+
     points.sort(key=lambda x: x[0], reverse=True)
     selected: list[str] = []
     seen: set[str] = set()

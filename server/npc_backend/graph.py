@@ -212,10 +212,12 @@ class NpcConversationEngine:
                 if not reply or len(reply) < 4:
                     reply = command_reply_from_scene(stance, scene_info, same_stance=same)
 
+                ops = intent.get("ops") or []
                 yield _event("command", {
                     "stance": stance,
                     "reply": reply,
                     "stance_changed": not same,
+                    "ops": ops,
                 })
                 # 指令也进对话线程，便于后续承接
                 self._schedule_memory_write(

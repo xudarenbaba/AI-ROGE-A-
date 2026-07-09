@@ -137,6 +137,46 @@
         return true;
       },
     },
+    {
+      id: "ally_split_ward",
+      name: "分身签",
+      faction: "ally",
+      kind: "conditional",
+      desc: "裂狱并行时，乌枭侧敌人更弱（约 -15%）",
+      apply(s) {
+        window.GameCoop?.applyBlessingFlags?.(s, "ally_split_ward");
+        return true;
+      },
+    },
+    {
+      id: "ally_command_seal",
+      name: "传声印",
+      faction: "ally",
+      kind: "tactical",
+      desc: "口令槽 +1（本局）",
+      apply(s) {
+        window.GameCoop?.applyBlessingFlags?.(s, "ally_command_seal");
+        if (s.coop) {
+          s.coop.commands.slotsMax = 3 + (s.coop.flags.commandSlotsBonus || 0);
+          s.coop.commands.slotsLeft = Math.min(
+            s.coop.commands.slotsMax,
+            s.coop.commands.slotsLeft + 1,
+          );
+        }
+        return true;
+      },
+    },
+    {
+      id: "pact_combo_spark",
+      name: "契火",
+      faction: "pact",
+      kind: "conditional",
+      desc: "契印连携充能速度 +50%",
+      apply(s) {
+        window.GameCoop?.applyBlessingFlags?.(s, "pact_combo_spark");
+        return true;
+      },
+    },
   ];
 
   const BY_ID = Object.fromEntries(POOL.map((b) => [b.id, b]));
@@ -220,7 +260,10 @@
     if (stackCount(state, "ally_mend")) tags.push("乌枭耐打");
     if (stackCount(state, "iron_veil")) tags.push("护盾强化");
     if (stackCount(state, "slayer_vitae")) tags.push("击杀回血");
-    return tags.slice(0, 4);
+    if (stackCount(state, "ally_split_ward")) tags.push("裂狱强化");
+    if (stackCount(state, "ally_command_seal")) tags.push("口令");
+    if (stackCount(state, "pact_combo_spark")) tags.push("连携");
+    return tags.slice(0, 5);
   }
 
   function summarizeForNpc(state) {
