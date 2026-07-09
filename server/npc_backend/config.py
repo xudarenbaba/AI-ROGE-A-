@@ -29,6 +29,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     },
     "memory": {
         "short_term_turns": 10,
+        "autonomy_log_max": 8,
         "k_world": 3,
         "k_persona": 3,
         "k_dialogue_daily": 4,
@@ -51,6 +52,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "require_scene_change": True,
         "stale_force_think_s": 55,
         "recent_lines_max": 8,
+        "run_journal_max": 16,
         "duplicate_similarity": 0.55,
         "max_speech_per_minute": 5,
         "triggers": {
@@ -70,6 +72,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "assault_stance_cooldown_s": 10,
         "polish": {
             "autonomous_quick": True,
+            "command_reply": True,
         },
     },
     "concurrency": {

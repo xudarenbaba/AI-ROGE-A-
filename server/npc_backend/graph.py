@@ -21,8 +21,19 @@ from server.npc_backend.llm import (
 from server.npc_backend.memory import MemoryStore
 from server.npc_backend.narrative import NarrativeState, NarrativeStore, scene_hash
 from server.npc_backend.polish import polish_line
+from server.npc_backend.postprocess import (
+    anti_ai_postprocess,
+    is_combat_scene,
+    strip_emotion_tag,
+)
 from server.npc_backend.prompts import build_messages
 from server.npc_backend.reflex import ReflexDecision, reflex_decide
+from server.npc_backend.salient import (
+    build_memory_search_query,
+    build_salient_snapshot,
+    command_reply_from_scene,
+    infer_chat_mode,
+)
 from server.npc_backend.triggers import (
     TriggerSpeech,
     assault_recommended,
@@ -42,8 +53,8 @@ _VALID_EMOTIONS = {
     "neutral", "focused", "annoyed", "worried", "happy", "tense", "sarcastic"
 }
 
-# delta 批量缓冲阈值（字符数）：积累到此长度或收到 LLM 流结束后统一 flush
-_DELTA_BATCH_CHARS = 8
+# delta 批量缓冲阈值（字符数）：首包更快
+_DELTA_BATCH_CHARS = 4
 
 
 def _enrich_scene_info(
@@ -56,9 +67,12 @@ def _enrich_scene_info(
     trigger_reason: str = "",
     priority: int = 3,
     opening: bool = False,
+    last_npc_line: str = "",
+    player_message: str = "",
+    mode: str = "think",
 ) -> dict[str, Any]:
     assault_ok = assault_recommended(scene_info, autonomy_cfg, opening=opening)
-    return {
+    base = {
         **scene_info,
         "trigger": trigger or str(scene_info.get("trigger", "")),
         "trigger_reason": trigger_reason or str(scene_info.get("trigger_reason", "")),
@@ -70,6 +84,14 @@ def _enrich_scene_info(
         "combat_mood": narrative_st.combat_mood,
         "stance_semantics": stance_semantics(scene_info),
     }
+    snap = build_salient_snapshot(
+        base,
+        last_npc_line=last_npc_line,
+        player_message=player_message,
+        mode=mode,
+    )
+    base["salient_snapshot"] = snap
+    return base
 
 
 class NpcConversationEngine:
@@ -90,18 +112,9 @@ class NpcConversationEngine:
         """
         统一流式入口，逐行 yield NDJSON 字符串。
 
-        事件类型：
-          meta    - 立即返回，携带 npc_id
-          command - 战术指令，携带 stance + reply，前端切换姿态后结束
-          delta   - 对话 token 批次（积累 _DELTA_BATCH_CHARS 字符后 flush）
-          done    - 对话完整结束，携带最终 ChatAction
-          error   - 出错，携带 fallback
-
-        并行优化：收到请求后立即同时启动：
-          - 意图分类 LLM（非流式）
-          - 短期记忆 + 长期记忆检索
-        若分类结果为 command，直接 yield command 事件，记忆检索结果丢弃。
-        若分类结果为 dialogue，记忆检索结果（大概率已完成）直接用于构建 prompt。
+        并行：意图分类 ∥ 对话线程 ∥ 长期记忆 ∥ narrative
+        场面 salient 同步生成（规则，0ms）。
+        command 立即返回模板确认语；dialogue 走 multi-turn 流式。
         """
         player_id: str = payload.get("player_id", "")
         npc_id: str = payload.get("npc_id", "")
@@ -109,36 +122,53 @@ class NpcConversationEngine:
         message: str = payload.get("message", "")
         scene_info: dict[str, Any] = payload.get("scene_info") or {}
 
-        self._narrative.on_player_message(player_id, npc_id)
+        self._narrative.on_player_message(player_id, npc_id, message)
         narrative_st = self._narrative.get(player_id, npc_id)
         self._narrative.update_mood(narrative_st, scene_info)
         autonomy_cfg = self._cfg.get("npc_autonomy", {})
+        last_line = (
+            self._narrative.last_spoken_line(player_id, npc_id)
+            or self._short_term.last_assistant_line(player_id, npc_id)
+        )
         scene_info = _enrich_scene_info(
             scene_info,
             narrative_st,
             self._narrative,
             autonomy_cfg,
             trigger="reactive",
+            last_npc_line=last_line,
+            player_message=message,
+            mode="chat",
         )
+        chat_mode = infer_chat_mode(message, scene_info)
+        scene_info["chat_mode"] = chat_mode
+
         _cancel, generation = self._inflight.begin(player_id, npc_id, "chat")
         yield _event("meta", {
             "npc_id": npc_id,
             "combat_mood": narrative_st.combat_mood,
+            "chat_mode": chat_mode,
         })
 
         try:
-            query = f"scene={scene_info}\nmessage={message}"
-            fast_intent = fast_command_intent(message)
-
-            fut_short: Future[list[dict[str, Any]]] = self._pool.submit(
-                self._short_term.get_recent, player_id, npc_id
+            search_query = build_memory_search_query(
+                player_message=message,
+                scene_info=scene_info,
+                npc_name=npc_name,
             )
+            fast_intent = fast_command_intent(message, scene_info)
+
+            fut_chat: Future[list[dict[str, str]]] = self._pool.submit(
+                self._short_term.get_chat_thread, player_id, npc_id, max_turns=8
+            )
+            # executor=None：在 worker 内用本地小池，避免与外层线程池嵌套死锁
             fut_long: Future[dict[str, list[str]]] = self._pool.submit(
                 self._memory.search_context,
-                query,
+                search_query,
                 player_id,
                 npc_id,
-                self._pool,
+                None,
+                chat_mode=chat_mode,
             )
             fut_narrative: Future[dict[str, str]] = self._pool.submit(
                 self._narrative.context_for_prompt, player_id, npc_id
@@ -165,15 +195,56 @@ class NpcConversationEngine:
                     action = ChatAction(
                         action_type="dialogue", dialogue=refusal, emotion="annoyed"
                     )
+                    self._schedule_memory_write(
+                        player_id=player_id,
+                        npc_id=npc_id,
+                        scene_info=scene_info,
+                        player_message=message,
+                        reply=refusal,
+                        memory_source="player",
+                    )
                     yield _event("done", {"action": action.model_dump(exclude_none=True)})
                     return
+
+                current = str(scene_info.get("ally_stance", ""))
+                same = current == stance
+                reply = str(intent.get("reply") or "").strip()
+                if not reply or len(reply) < 4:
+                    reply = command_reply_from_scene(stance, scene_info, same_stance=same)
+
                 yield _event("command", {
                     "stance": stance,
-                    "reply": intent["reply"],
+                    "reply": reply,
+                    "stance_changed": not same,
                 })
+                # 指令也进对话线程，便于后续承接
+                self._schedule_memory_write(
+                    player_id=player_id,
+                    npc_id=npc_id,
+                    scene_info=scene_info,
+                    player_message=message,
+                    reply=reply,
+                    memory_source="player",
+                    skip_long_term=True,
+                )
+                # 可选异步润色（不阻塞姿态切换）
+                polish_cfg = autonomy_cfg.get("polish", {})
+                if polish_cfg.get("command_reply", True):
+                    yield from self._maybe_polish(
+                        reply,
+                        player_id=player_id,
+                        npc_id=npc_id,
+                        npc_name=npc_name,
+                        scene_info=scene_info,
+                        generation=generation,
+                        intent=f"command_{stance}",
+                        skip=False,
+                        quick=True,
+                    )
                 return
 
-            short_term_history: list[dict[str, Any]] = fut_short.result()
+            # dialogue：等待并行结果
+            chat_thread: list[dict[str, str]] = fut_chat.result()
             long_term_ctx: dict[str, list[str]] = fut_long.result()
             narrative_ctx: dict[str, str] = fut_narrative.result()
 
@@ -190,9 +261,18 @@ class NpcConversationEngine:
                 persona_chunks=long_term_ctx.get("persona_chunks", []),
                 dialogue_daily_chunks=long_term_ctx.get("dialogue_daily_chunks", []),
                 dialogue_important_chunks=long_term_ctx.get("dialogue_important_chunks", []),
-                short_term_history=short_term_history,
+                short_term_history=[],
                 narrative_context=narrative_ctx,
+                chat_thread=chat_thread,
+                chat_mode=chat_mode,
+                last_npc_line=last_line,
             )
+
+            combat = is_combat_scene(scene_info) or chat_mode in (
+                "combat_ack", "combat_question"
+            )
+            max_tokens = 100 if combat else 220
+            temperature = 0.45 if chat_mode == "rest_banter" else 0.35
 
             yield from self._stream_dialogue(
                 messages=messages,
@@ -203,6 +283,9 @@ class NpcConversationEngine:
                 player_message=message,
                 generation=generation,
                 memory_source="player",
+                max_tokens=max_tokens,
+                temperature=temperature,
+                combat=combat,
             )
 
         except Exception as exc:  # noqa: BLE001
@@ -234,6 +317,7 @@ class NpcConversationEngine:
         opening = trigger_reason in ("floor_enter", "opening") or "floor_enter" in (
             scene_info.get("recent_events") or []
         )
+        last_line = self._narrative.last_spoken_line(player_id, npc_id)
         scene_info = _enrich_scene_info(
             scene_info,
             narrative_st,
@@ -243,6 +327,8 @@ class NpcConversationEngine:
             trigger_reason=trigger_reason,
             priority=priority,
             opening=opening,
+            last_npc_line=last_line,
+            mode="think",
         )
 
         situation = (
@@ -251,10 +337,22 @@ class NpcConversationEngine:
             f" 友军HP={scene_info.get('ally_hp', '?')}"
             f" 敌={scene_info.get('enemy_count', '?')}"
         )
-        prefetch_query = f"scene={scene_info}\ntrigger={trigger}\nsituation={situation}"
-        fut_short = self._pool.submit(self._short_term.get_recent, player_id, npc_id)
+        prefetch_query = build_memory_search_query(
+            player_message=situation,
+            scene_info=scene_info,
+            npc_name=npc_name,
+            trigger=trigger,
+        )
+        fut_chat = self._pool.submit(
+            self._short_term.get_chat_thread, player_id, npc_id, max_turns=6
+        )
         fut_long = self._pool.submit(
-            self._memory.search_context, prefetch_query, player_id, npc_id, self._pool,
+            self._memory.search_context,
+            prefetch_query,
+            player_id,
+            npc_id,
+            None,
+            chat_mode="combat_ack",
         )
 
         rule_speech: TriggerSpeech | None = None
@@ -368,7 +466,7 @@ class NpcConversationEngine:
             allowed = self._allowed_intents_for_trigger(
                 trigger, narrative_st, scene_info,
             )
-            short_term_history = fut_short.result()
+            chat_thread = fut_chat.result()
             long_term_ctx = fut_long.result()
 
             if self._inflight.is_cancelled(player_id, npc_id, generation):
@@ -390,10 +488,11 @@ class NpcConversationEngine:
                 persona_chunks=long_term_ctx.get("persona_chunks", []),
                 dialogue_daily_chunks=long_term_ctx.get("dialogue_daily_chunks", []),
                 dialogue_important_chunks=long_term_ctx.get("dialogue_important_chunks", []),
-                short_term_history=short_term_history,
+                short_term_history=[],
                 narrative_context=narrative_ctx,
                 allowed_intents=allowed,
                 trigger=trigger,
+                chat_thread=chat_thread,
             ).result()
 
             validated, reject = self._narrative.validate_decision(
@@ -518,11 +617,16 @@ class NpcConversationEngine:
         player_message: str,
         generation: int,
         memory_source: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        combat: bool = False,
     ) -> Iterator[str]:
         full_reply_parts: list[str] = []
         batch: list[str] = []
 
-        for delta in chat_completion_stream(messages):
+        for delta in chat_completion_stream(
+            messages, max_tokens=max_tokens, temperature=temperature
+        ):
             if self._inflight.is_cancelled(player_id, npc_id, generation):
                 return
             full_reply_parts.append(delta)
@@ -535,17 +639,27 @@ class NpcConversationEngine:
             yield _event("delta", {"text": "".join(batch)})
 
         raw_reply = "".join(full_reply_parts).strip()
-        emotion = "neutral"
-        m = _EMOTION_RE.search(raw_reply)
-        if m:
-            candidate = m.group(1).lower()
-            emotion = candidate if candidate in _VALID_EMOTIONS else "neutral"
-            raw_reply = _EMOTION_RE.sub("", raw_reply).strip()
+        cleaned, emo_from_tag = strip_emotion_tag(raw_reply)
+        emotion = emo_from_tag if emo_from_tag in _VALID_EMOTIONS else "neutral"
+        if emo_from_tag is None:
+            m = _EMOTION_RE.search(raw_reply)
+            if m:
+                candidate = m.group(1).lower()
+                emotion = candidate if candidate in _VALID_EMOTIONS else "neutral"
+                cleaned = _EMOTION_RE.sub("", raw_reply).strip()
 
-        full_reply = raw_reply or "收到，我会继续和你协同。"
+        recent = self._narrative.get(player_id, npc_id).recent_reply_texts
+        full_reply = anti_ai_postprocess(
+            cleaned or "收到，我会继续和你协同。",
+            combat=combat,
+            max_chars=48 if combat else 160,
+            recent_texts=recent,
+        ) or "收到，我会继续和你协同。"
+
         action = ChatAction(action_type="dialogue", dialogue=full_reply, emotion=emotion)
         yield _event("done", {"action": action.model_dump(exclude_none=True)})
 
+        self._narrative.note_chat_reply(player_id, npc_id, full_reply)
         self._schedule_memory_write(
             player_id=player_id,
             npc_id=npc_id,
@@ -601,13 +715,18 @@ class NpcConversationEngine:
                 yield _event("noop", {})
                 return
             current = str(scene_info.get("ally_stance", ""))
+            reply = str(decision.get("reply", "")).strip()
+            if not reply:
+                reply = command_reply_from_scene(
+                    stance, scene_info, same_stance=(stance == current)
+                )
+            reply = anti_ai_postprocess(reply, combat=True, max_chars=48) or reply
             yield _event("command", {
                 "stance": stance,
-                "reply": decision.get("reply", "收到。"),
+                "reply": reply,
                 "stance_changed": stance != current,
                 "intent": intent_tag,
             })
-            reply = str(decision.get("reply", "")).strip()
             if reply:
                 self._schedule_memory_write(
                     player_id=player_id,
@@ -636,6 +755,12 @@ class NpcConversationEngine:
             if not reply:
                 yield _event("noop", {})
                 return
+            reply = anti_ai_postprocess(
+                reply,
+                combat=is_combat_scene(scene_info),
+                max_chars=48,
+                recent_texts=self._narrative.get(player_id, npc_id).recent_reply_texts,
+            ) or reply
             emotion = "worried" if scene_info.get("ally_in_danger") else "focused"
             action = ChatAction(action_type="dialogue", dialogue=reply, emotion=emotion)
             yield _event("done", {
@@ -695,6 +820,9 @@ class NpcConversationEngine:
             return
         if not polished or self._inflight.is_cancelled(player_id, npc_id, generation):
             return
+        polished = anti_ai_postprocess(
+            polished, combat=is_combat_scene(scene_info), max_chars=48
+        ) or polished
         yield _event("polish", {"dialogue": polished, "emotion": "focused"})
 
     def _schedule_memory_write(
@@ -706,33 +834,37 @@ class NpcConversationEngine:
         player_message: str,
         reply: str,
         memory_source: str,
+        skip_long_term: bool = False,
     ) -> None:
         min_chars = int(self._cfg.get("memory", {}).get("min_store_chars", 6))
 
         def _write_memory() -> None:
             if memory_source == "autonomous":
-                self._short_term.add_turn(
-                    player_id, npc_id, "system", f"[自主思考] {player_message}"
+                # 自主台词只进 autonomy_log，不污染对话线程
+                self._short_term.add_autonomy(
+                    player_id, npc_id, reply, intent=player_message
                 )
-            else:
-                self._short_term.add_turn(player_id, npc_id, "user", player_message)
-            self._short_term.add_turn(player_id, npc_id, "assistant", reply)
-            if len(reply) >= min_chars:
-                try:
-                    tier, text = classify_dialogue_memory(
-                        player_message=player_message,
-                        npc_reply=reply,
-                        scene_info=scene_info,
-                    )
-                    self._memory.add_dialogue_memory(
-                        player_id=player_id,
-                        npc_id=npc_id,
-                        dialogue_tier=tier,
-                        text=text,
-                        scene_info=scene_info,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+                # 自主默认不写 long-term，或仅极短 daily 摘要；避免冲掉玩家对话记忆
+                return
+            self._short_term.add_chat(player_id, npc_id, "user", player_message)
+            self._short_term.add_chat(player_id, npc_id, "assistant", reply)
+            if skip_long_term or len(reply) < min_chars:
+                return
+            try:
+                tier, text = classify_dialogue_memory(
+                    player_message=player_message,
+                    npc_reply=reply,
+                    scene_info=scene_info,
+                )
+                self._memory.add_dialogue_memory(
+                    player_id=player_id,
+                    npc_id=npc_id,
+                    dialogue_tier=tier,
+                    text=text,
+                    scene_info=scene_info,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         threading.Thread(target=_write_memory, daemon=True).start()
 

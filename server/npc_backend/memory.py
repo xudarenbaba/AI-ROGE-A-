@@ -191,18 +191,23 @@ class MemoryStore:
         player_id: str,
         npc_id: str,
         executor: ThreadPoolExecutor | None = None,
+        *,
+        chat_mode: str = "",
+        weights: dict[str, int] | None = None,
     ) -> dict[str, list[str]]:
-        """query 只 embed 一次，并行查询四路记忆，返回结构化上下文。"""
+        """query 只 embed 一次，并行查询四路记忆；可按 chat_mode 调整 k。"""
         embedding = _embed_texts([query])[0]
+
+        k_world, k_persona, k_daily, k_important = self._k_for_mode(chat_mode, weights)
 
         tasks = {
             "world_chunks": (
                 {"memory_type": "world", "npc_id": "global"},
-                self._k_world,
+                k_world,
             ),
             "persona_chunks": (
                 {"memory_type": "persona", "npc_id": npc_id},
-                self._k_persona,
+                k_persona,
             ),
             "dialogue_daily_chunks": (
                 {
@@ -211,7 +216,7 @@ class MemoryStore:
                     "player_id": player_id,
                     "npc_id": npc_id,
                 },
-                self._k_daily,
+                k_daily,
             ),
             "dialogue_important_chunks": (
                 {
@@ -220,11 +225,34 @@ class MemoryStore:
                     "player_id": player_id,
                     "npc_id": npc_id,
                 },
-                self._k_important,
+                k_important,
             ),
         }
 
         return self._parallel_query_tasks(tasks, embedding, executor)
+
+    def _k_for_mode(
+        self,
+        chat_mode: str,
+        weights: dict[str, int] | None,
+    ) -> tuple[int, int, int, int]:
+        if weights:
+            return (
+                int(weights.get("world", self._k_world)),
+                int(weights.get("persona", self._k_persona)),
+                int(weights.get("daily", self._k_daily)),
+                int(weights.get("important", self._k_important)),
+            )
+        # 分意图加权：闲聊/人设偏 persona+important；战术偏 daily；设定偏 world
+        if chat_mode == "meta_lore":
+            return (max(self._k_world, 4), max(self._k_persona, 3), 2, max(self._k_important, 4))
+        if chat_mode == "emotional":
+            return (1, max(self._k_persona, 3), 2, max(self._k_important, 5))
+        if chat_mode in ("combat_ack", "combat_question"):
+            return (1, 2, max(self._k_daily, 4), max(self._k_important, 3))
+        if chat_mode == "rest_banter":
+            return (2, max(self._k_persona, 3), max(self._k_daily, 4), max(self._k_important, 4))
+        return (self._k_world, self._k_persona, self._k_daily, self._k_important)
 
     def _parallel_query_tasks(
         self,

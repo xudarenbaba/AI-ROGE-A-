@@ -95,6 +95,17 @@ class NarrativeState:
     last_floor_commented: int = 0
     boss_warned_floor: int = -1
     prev_enemy_count: int = -1
+    # 本局 working memory
+    run_journal: list[str] = field(default_factory=list)
+    journal_summary: str = ""
+    trust: float = 0.5
+    annoyance: float = 0.2
+    banter_level: float = 0.5
+    last_player_message: str = ""
+    last_chat_reply: str = ""
+    last_floor_seen: int = 0
+    rescued_player_count: int = 0
+    blessings_noted: list[str] = field(default_factory=list)
 
 
 class NarrativeStore:
@@ -111,10 +122,100 @@ class NarrativeStore:
         with self._lock:
             return self._states.setdefault(self._key(player_id, npc_id), NarrativeState())
 
-    def on_player_message(self, player_id: str, npc_id: str) -> None:
+    def on_player_message(self, player_id: str, npc_id: str, message: str = "") -> None:
         with self._lock:
             st = self._states.setdefault(self._key(player_id, npc_id), NarrativeState())
             st.consecutive_noop = 0
+            if message.strip():
+                st.last_player_message = message.strip()[:120]
+                low = message.strip()
+                if any(k in low for k in ("谢谢", "靠谱", "不错", "厉害", "救我")):
+                    st.trust = min(1.0, st.trust + 0.05)
+                    st.annoyance = max(0.0, st.annoyance - 0.03)
+                if any(k in low for k in ("滚", "闭嘴", "废物", "蠢", "白痴")):
+                    st.annoyance = min(1.0, st.annoyance + 0.08)
+                    st.banter_level = min(1.0, st.banter_level + 0.05)
+
+    def note_chat_reply(self, player_id: str, npc_id: str, reply: str) -> None:
+        with self._lock:
+            st = self._states.setdefault(self._key(player_id, npc_id), NarrativeState())
+            text = reply.strip()
+            if not text:
+                return
+            st.last_chat_reply = text[:120]
+            st.recent_reply_texts.append(text)
+            st.recent_reply_texts = st.recent_reply_texts[-int(self._cfg.get("recent_lines_max", 8)) :]
+            st.last_speech_at = time.time()
+
+    def update_run_journal(self, st: NarrativeState, scene_info: dict[str, Any]) -> None:
+        """根据场面变化追加本局共同经历（去重、限长）。"""
+        floor = int(scene_info.get("floor", 0) or 0)
+        events = list(scene_info.get("recent_events") or [])
+        notes: list[str] = []
+
+        if floor and floor != st.last_floor_seen:
+            name = str(scene_info.get("floor_name") or "").strip()
+            notes.append(f"进入第{floor}层{('·' + name) if name else ''}")
+            st.last_floor_seen = floor
+
+        if "boss_spawn" in events or scene_info.get("boss_alive"):
+            boss = str(scene_info.get("boss_name") or "Boss").strip()
+            notes.append(f"遭遇Boss「{boss}」")
+
+        if "blessing_picked" in events or scene_info.get("blessing_just_picked"):
+            bp = scene_info.get("blessing_just_picked") or {}
+            bname = ""
+            if isinstance(bp, dict):
+                bname = str(bp.get("name") or "").strip()
+            if bname and bname not in st.blessings_noted:
+                st.blessings_noted.append(bname)
+                notes.append(f"你选了狱印「{bname}」")
+            elif not bname:
+                notes.append("你选了一枚狱印")
+
+        if "floor_clear" in events or str(scene_info.get("floor_state")) == "clear":
+            notes.append(f"第{floor or '?'}层肃清")
+
+        player_pct = scene_info.get("player_hp_pct")
+        try:
+            p = float(player_pct) if player_pct is not None else 1.0
+        except (TypeError, ValueError):
+            p = 1.0
+        if p <= 0.30 and scene_info.get("ally_stance") == "guard":
+            note = f"第{floor}层你残血时我贴身护过你"
+            if note not in st.run_journal:
+                st.rescued_player_count += 1
+                notes.append(note)
+
+        if scene_info.get("ally_down"):
+            note = "我灵核失稳倒地过"
+            if note not in st.run_journal:
+                notes.append(note)
+
+        for note in notes:
+            if note and note not in st.run_journal[-8:]:
+                st.run_journal.append(note)
+        max_j = int(self._cfg.get("run_journal_max", 16))
+        st.run_journal = st.run_journal[-max_j:]
+        # 压缩摘要
+        if st.run_journal:
+            st.journal_summary = "；".join(st.run_journal[-6:])
+
+    def relation_block(self, st: NarrativeState) -> str:
+        trust = "高" if st.trust >= 0.7 else ("低" if st.trust <= 0.35 else "中")
+        annoy = "高" if st.annoyance >= 0.55 else ("低" if st.annoyance <= 0.25 else "中")
+        banter = "重" if st.banter_level >= 0.65 else ("轻" if st.banter_level <= 0.35 else "中")
+        return (
+            f"信任={trust}({st.trust:.2f})；烦躁={annoy}({st.annoyance:.2f})；"
+            f"碎嘴={banter}；本局护你次数≈{st.rescued_player_count}"
+        )
+
+    def journal_block(self, st: NarrativeState) -> str:
+        if st.journal_summary:
+            return st.journal_summary
+        if st.run_journal:
+            return "；".join(st.run_journal[-6:])
+        return "本局尚无特别记下的共同经历。"
 
     def update_mood(self, st: NarrativeState, scene_info: dict[str, Any]) -> None:
         ally_pct = float(scene_info.get("ally_hp_pct", 1) or 1)
@@ -142,6 +243,8 @@ class NarrativeStore:
         if st.combat_mood == "relieved" and st.last_speech_at:
             if time.time() - st.last_speech_at > 8:
                 st.combat_mood = "observing"
+
+        self.update_run_journal(st, scene_info)
 
     def mood_block(self, st: NarrativeState) -> str:
         hints = {
@@ -427,10 +530,31 @@ class NarrativeStore:
 
     def context_for_prompt(self, player_id: str, npc_id: str) -> dict[str, str]:
         st = self.get(player_id, npc_id)
+        last_auto = ""
+        for item in reversed(st.recent_lines):
+            if item.type != "noop" and item.text:
+                last_auto = item.text
+                break
         return {
             "intent_block": self.intent_block(st),
             "recent_autonomous": self.recent_lines_for_prompt(
                 st, int(self._cfg.get("recent_lines_max", 5))
             ),
             "mood_block": self.mood_block(st),
+            "journal_block": self.journal_block(st),
+            "relation_block": self.relation_block(st),
+            "last_autonomous_line": last_auto or "无",
+            "last_chat_reply": st.last_chat_reply or "无",
+            "last_player_message": st.last_player_message or "无",
         }
+
+    def last_spoken_line(self, player_id: str, npc_id: str) -> str:
+        st = self.get(player_id, npc_id)
+        if st.last_chat_reply:
+            return st.last_chat_reply
+        for item in reversed(st.recent_lines):
+            if item.type != "noop" and item.text:
+                return item.text
+        if st.recent_reply_texts:
+            return st.recent_reply_texts[-1]
+        return ""

@@ -8,6 +8,7 @@ from openai import OpenAI
 
 from server.npc_backend.config import load_config
 from server.npc_backend.prompts import build_memory_classify_messages
+from server.npc_backend.salient import command_reply_from_scene
 
 # 支持的姿态集合（前端 game.js 中的 state.ally.stance 枚举值）
 VALID_STANCES = {"guard", "assault"}
@@ -39,31 +40,49 @@ def _client() -> OpenAI:
     )
 
 
-def chat_completion(messages: list[dict[str, str]], *, model: str | None = None) -> str:
+def chat_completion(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    timeout_s: int | None = None,
+) -> str:
     cfg = load_config().get("llm", {})
     use_model = model or cfg.get("model", "deepseek-chat")
-    resp = _client().chat.completions.create(
-        model=use_model,
-        messages=messages,
-        temperature=float(cfg.get("temperature", 0.3)),
-        timeout=int(cfg.get("timeout_s", 60)),
-    )
+    kwargs: dict[str, Any] = {
+        "model": use_model,
+        "messages": messages,
+        "temperature": float(cfg.get("temperature", 0.3) if temperature is None else temperature),
+        "timeout": int(cfg.get("timeout_s", 60) if timeout_s is None else timeout_s),
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = int(max_tokens)
+    resp = _client().chat.completions.create(**kwargs)
     choice = resp.choices[0] if resp.choices else None
     if not choice or not choice.message:
         return ""
     return (choice.message.content or "").strip()
 
 
-def chat_completion_stream(messages: list[dict[str, str]]) -> Iterator[str]:
+def chat_completion_stream(
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+) -> Iterator[str]:
     """逐 token yield 文本 delta，不处理业务状态和记忆。"""
     cfg = load_config().get("llm", {})
-    stream = _client().chat.completions.create(
-        model=cfg.get("model", "deepseek-chat"),
-        messages=messages,
-        temperature=float(cfg.get("temperature", 0.3)),
-        timeout=int(cfg.get("timeout_s", 60)),
-        stream=True,
-    )
+    kwargs: dict[str, Any] = {
+        "model": cfg.get("model", "deepseek-chat"),
+        "messages": messages,
+        "temperature": float(cfg.get("temperature", 0.3) if temperature is None else temperature),
+        "timeout": int(cfg.get("timeout_s", 60)),
+        "stream": True,
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = int(max_tokens)
+    stream = _client().chat.completions.create(**kwargs)
     for chunk in stream:
         if not chunk.choices:
             continue
@@ -84,6 +103,7 @@ def autonomous_decide(
     narrative_context: dict[str, str] | None = None,
     allowed_intents: list[str] | None = None,
     trigger: str = "periodic",
+    chat_thread: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
     自主思考：根据局面决定 noop / command / dialogue。
@@ -106,11 +126,12 @@ def autonomous_decide(
         narrative_context=narrative_context,
         allowed_intents=allowed_intents,
         trigger=trigger or str(scene_info.get("trigger", "periodic")),
+        chat_thread=chat_thread,
     )
     cfg = load_config().get("llm", {})
     decide_model = cfg.get("decide_model") or cfg.get("model", "deepseek-chat")
     try:
-        raw = chat_completion(messages, model=decide_model)
+        raw = chat_completion(messages, model=decide_model, max_tokens=120, timeout_s=25)
         stripped = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data: dict[str, Any] = json.loads(stripped)
         decision_type = str(data.get("type", "")).strip()
@@ -135,24 +156,31 @@ _GUARD_HINTS = ("守护我", "跟着我", "贴着我", "别乱跑", "回来", "�
 _ASSAULT_HINTS = ("突击", "冲上去", "开路", "压制", "上去打", "前锋", "进攻", "去突击")
 
 
-def fast_command_intent(message: str) -> dict[str, Any] | None:
-    """短句战术指令快路径，跳过意图分类 LLM。"""
+def fast_command_intent(
+    message: str,
+    scene_info: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """短句战术指令快路径，跳过意图分类 LLM；确认语带场面槽位。"""
     text = message.strip()
     if not text or len(text) > 24:
         return None
+    scene_info = scene_info or {}
+    current = str(scene_info.get("ally_stance", "") or "")
     for hint in _GUARD_HINTS:
         if hint in text:
+            same = current == "guard"
             return {
                 "type": "command",
                 "stance": "guard",
-                "reply": _STANCE_REPLIES["guard"],
+                "reply": command_reply_from_scene("guard", scene_info, same_stance=same),
             }
     for hint in _ASSAULT_HINTS:
         if hint in text:
+            same = current == "assault"
             return {
                 "type": "command",
                 "stance": "assault",
-                "reply": _STANCE_REPLIES["assault"],
+                "reply": command_reply_from_scene("assault", scene_info, same_stance=same),
             }
     return None
 
@@ -168,7 +196,7 @@ def classify_intent(
 
     返回：
       - {"type": "dialogue"}
-      - {"type": "command", "stance": "guard|assault|skirmish", "reply": "..."}
+      - {"type": "command", "stance": "guard|assault", "reply": "..."}
     """
     from server.npc_backend.prompts import build_intent_classify_prompt
 
@@ -178,17 +206,31 @@ def classify_intent(
         scene_info=scene_info,
     )
     try:
-        raw = chat_completion([
-            {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ])
+        raw = chat_completion(
+            [
+                {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=80,
+            timeout_s=12,
+            temperature=0.1,
+        )
         stripped = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data: dict[str, Any] = json.loads(stripped)
         if str(data.get("type", "")).strip() == "command":
             stance = str(data.get("stance", "")).strip()
             if stance not in VALID_STANCES:
                 raise ValueError(f"invalid stance: {stance}")
-            reply = str(data.get("reply", _STANCE_REPLIES.get(stance, "收到。"))).strip()
+            current = str(scene_info.get("ally_stance", "") or "")
+            same = current == stance
+            reply = str(
+                data.get("reply")
+                or command_reply_from_scene(stance, scene_info, same_stance=same)
+                or _STANCE_REPLIES.get(stance, "收到。")
+            ).strip()
+            # 若模型确认语太空，用场面模板
+            if len(reply) < 4:
+                reply = command_reply_from_scene(stance, scene_info, same_stance=same)
             return {"type": "command", "stance": stance, "reply": reply}
     except Exception:
         pass
@@ -196,24 +238,9 @@ def classify_intent(
 
 
 def generate_no_hp_reply(*, npc_name: str) -> str:
-    """
-    NPC 灵核失稳（hp=0）时被要求突击，生成一句符合人设的拒绝回复。
-    使用轻量单次调用，不走记忆检索。
-    失败时返回硬编码兜底文本。
-    """
-    system_prompt = (
-        f"你是 NPC「{npc_name}」，嘴臭话痨，但此刻灵核失稳、无法战斗。"
-        "玩家要求你去突击，你需要用一句话拒绝，语气可以无奈、嘴硬或自嘲，"
-        "符合话痨人设，不超过20字，不要解释原因只说无法执行。只输出这一句话，不加引号。"
-    )
-    try:
-        reply = chat_completion([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "玩家让你去突击。"},
-        ]).strip()
-        return reply or "灵核失稳了，冲不动，别催。"
-    except Exception:  # noqa: BLE001
-        return "灵核失稳了，冲不动，别催。"
+    """灵核失稳时拒绝突击：优先硬编码，避免额外 LLM 延迟。"""
+    _ = npc_name
+    return "灵核失稳了，冲不动，别催。"
 
 
 def classify_dialogue_memory(
