@@ -87,6 +87,55 @@ body {
   display: none;
 }
 
+.demo-complete-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: rgba(8, 6, 14, 0.88);
+  border-radius: 4px;
+  z-index: 6;
+  padding: 20px;
+  text-align: center;
+}
+
+.demo-complete-overlay.hidden {
+  display: none;
+}
+
+.demo-complete-overlay h3 {
+  margin: 0;
+  color: #e0c8ff;
+  font-size: 22px;
+}
+
+.demo-complete-overlay p {
+  margin: 0;
+  color: #c9b8d8;
+  font-size: 14px;
+  max-width: 360px;
+  line-height: 1.45;
+}
+
+.demo-restart-btn {
+  margin-top: 8px;
+  padding: 10px 22px;
+  border: 1px solid #a88fd4;
+  border-radius: 8px;
+  background: linear-gradient(145deg, #4a3068, #2a1840);
+  color: #f0e4ff;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.demo-restart-btn:hover {
+  border-color: #d4b0ff;
+  background: linear-gradient(145deg, #5a4080, #3a2860);
+}
+
 .blessing-overlay.picked {
   pointer-events: none;
 }

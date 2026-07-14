@@ -1,11 +1,9 @@
-/** 一层地下城：线性房间 + 协同房插入 */
+/** 一层地下城：前厅 → 特殊协同房 → 精英 → Boss */
 (function () {
   const ROOM_CHAIN = [
     { type: "entrance", label: "前厅", depth: 0, mobs: 3, elite: 0, boss: false },
-    { type: "corridor", label: "阴廊", depth: 1, mobs: 4, elite: 0, boss: false },
-    { type: "combat", label: "狱房", depth: 2, mobs: 6, elite: 0, boss: false },
-    { type: "elite", label: "精英房", depth: 3, mobs: 3, elite: 1, boss: false },
-    { type: "boss", label: "Boss房", depth: 4, mobs: 2, elite: 0, boss: true },
+    { type: "elite", label: "精英房", depth: 2, mobs: 3, elite: 1, boss: false },
+    { type: "boss", label: "Boss房", depth: 3, mobs: 2, elite: 0, boss: true },
   ];
 
   function mobCount(tpl, floor) {
@@ -19,7 +17,7 @@
       return {
         type: "duo_split",
         label: "裂狱并行",
-        depth: 1.5,
+        depth: 1,
         mobs: 5,
         elite: 0,
         boss: false,
@@ -31,7 +29,7 @@
       return {
         type: "duo_info",
         label: "判词分卷",
-        depth: 1.5,
+        depth: 1,
         mobs: 3,
         elite: 0,
         boss: false,
@@ -42,7 +40,7 @@
       return {
         type: "duo_proxy",
         label: "黑签代行",
-        depth: 2.5,
+        depth: 1,
         mobs: 5,
         elite: 0,
         boss: false,
@@ -52,7 +50,7 @@
     return {
       type: "duo_split",
       label: "裂狱并行",
-      depth: 1.5,
+      depth: 1,
       mobs: 5 + Math.min(2, floor - 1),
       elite: 0,
       boss: false,
@@ -62,7 +60,7 @@
 
   function generate(floor) {
     const chain = ROOM_CHAIN.map((tpl) => ({ ...tpl }));
-    // 插入协同房：entrance 之后
+    // 前厅之后插入特殊协同房
     const duo = pickDuoInsert(floor);
     chain.splice(1, 0, duo);
 

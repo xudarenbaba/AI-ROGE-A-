@@ -1,6 +1,7 @@
 const NPC_API = "http://127.0.0.1:5100";
 const NPC_AUTONOMY_BUILD = "autonomy10";
-const GAME_BUILD = "skill1";
+const GAME_BUILD = "demo3e";
+const MAX_FLOORS = 3;
 
 // ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
 // onnxruntime-web 从 CDN 加载；如需离线部署可改为本地路径。
@@ -522,22 +523,7 @@ const chatInput = document.getElementById("chatInput");
 const FLOOR_META = [
   { name: "拔舌狱", tone: "#542127", accent: "#c65f52", haze: "#2a0f12", hint: "妄言会在这里变成锁链，少站直线位。" },
   { name: "剪刀狱", tone: "#4a202b", accent: "#ce7a6e", haze: "#1f1016", hint: "敌群会连线增伤，优先切断牵引目标。" },
-  { name: "铁树狱", tone: "#40272c", accent: "#ad7c5a", haze: "#171115", hint: "冲刺别贪，刺林会惩罚错误位移。" },
-  { name: "孽镜狱", tone: "#2f2638", accent: "#8f7fe0", haze: "#120f1d", hint: "镜像会复刻行动，先辨认真身再集火。" },
-  { name: "蒸笼狱", tone: "#5b2a1d", accent: "#de8a58", haze: "#24120f", hint: "热压会叠层，别在闷区久留。" },
-  { name: "铜柱狱", tone: "#5a2e19", accent: "#d88946", haze: "#28150a", hint: "火线扩散很快，卡掩体边缘走。" },
-  { name: "刀山狱", tone: "#402826", accent: "#ba8f88", haze: "#1b1314", hint: "地形比怪更危险，先抢安全落脚点。" },
-  { name: "冰山狱", tone: "#1d2a3f", accent: "#7ab8d1", haze: "#101722", hint: "冻结后伤害翻倍，别硬吃连续弹道。" },
-  { name: "油锅狱", tone: "#52301a", accent: "#d48e4f", haze: "#23160b", hint: "油溅有抛物轨迹，保持横向机动。" },
-  { name: "牛坑狱", tone: "#3f281f", accent: "#be7c57", haze: "#190f0a", hint: "冲锋波次会连段，留一个位移保命。" },
-  { name: "石压狱", tone: "#3f3132", accent: "#a6978d", haze: "#161314", hint: "塌陷有读秒，宁可少打也别贪刀。" },
-  { name: "舂臼狱", tone: "#49352b", accent: "#b89271", haze: "#19120f", hint: "节拍是活路，跟着环境节律移动。" },
-  { name: "血池狱", tone: "#5a1f29", accent: "#d66b73", haze: "#2a0e14", hint: "侵蚀会滚雪球，别在血潭硬站桩。" },
-  { name: "枉死狱", tone: "#30212d", accent: "#a88db9", haze: "#18101d", hint: "怨魂会扰乱目标，先解控再输出。" },
-  { name: "磔刑狱", tone: "#4f2623", accent: "#d37669", haze: "#220f0f", hint: "分部位破坏更高效，别均摊伤害。" },
-  { name: "火山狱", tone: "#66261c", accent: "#ee7b42", haze: "#2e120a", hint: "喷发前有前兆，提前换位。" },
-  { name: "石磨狱", tone: "#41332a", accent: "#b8a27d", haze: "#1c1410", hint: "碾压周期固定，记住三拍后撤。" },
-  { name: "无间边狱", tone: "#2a182b", accent: "#b070da", haze: "#140b16", hint: "终层按因果结算，稳住比抢速更重要。" },
+  { name: "孽镜狱", tone: "#2f2638", accent: "#8f7fe0", haze: "#120f1d", hint: "镜中假乌枭无对话，会寻路与突击；绿标才是真身。" },
 ];
 
 const state = {
@@ -820,31 +806,47 @@ function spawnRoomEnemies(room) {
     });
     const bossMeta = window.GameBosses.getForFloor(state.floor);
     const bp = spawns.boss || { x: 720, y: 270 };
-    const pos = findClearSpawnPos(bp.x, bp.y, 20, { others: enemies });
-    const bossHpMul = scale.hpMul * bossMeta.hpMul * eliteBossHpMul(room);
-    const boss = {
-      kind: "boss",
-      bossName: bossMeta.name,
-      ultName: bossMeta.ult,
-      skillId: bossMeta.skillId,
-      skillName: bossMeta.skillName,
-      x: pos.x, y: pos.y,
-      hp: Math.round(380 * bossHpMul),
-      maxHp: Math.round(380 * bossHpMul),
-      radius: 20,
-      speed: 32 * scale.speedMul,
-      shootCd: 1.0,
-      dmgMul: eliteBossDmgMul(scale) * BOSS_DMG_MUL,
-      shootCdMul: scale.shootCdMul,
-      fanChance: bossMeta.fanChance,
-      ultInterval: bossMeta.ultInterval,
-      ultCd: 1.8,
-      aoeColor: bossMeta.aoeColor,
-    };
-    window.GameEnemyAI?.initEnemy(boss, state.floor, room.index);
-    window.GameBossPatterns?.spawnEntranceAoE?.(state, boss);
-    enemies.push(boss);
-    npcPushEvent("boss_spawn", { floor: state.floor });
+    if (bossMeta.archetype === "mirror_wuxiao" && window.GameMirrorBoss) {
+      const pos = findClearSpawnPos(bp.x, bp.y, 14, { others: enemies });
+      const boss = window.GameMirrorBoss.create(pos, {
+        hpMul: scale.hpMul * eliteBossHpMul(room),
+        speedMul: scale.speedMul,
+        dmgMul: eliteBossDmgMul(scale) * BOSS_DMG_MUL,
+        shootCdMul: scale.shootCdMul,
+      }, bossMeta);
+      enemies.push(boss);
+      window.GameMirrorBoss?.reset?.();
+      if (_rlLoadState === "idle") _rlLoadModel();
+      setAllyBubble("孽镜照出假我了。绿标是我，紫影才是镜影——别认错。");
+      appendMessage("npc", "【孽镜狱】Boss 是假乌枭：不会对话，A*接近 + 独立 ONNX 突击。绿圈「真·枭」才是我。");
+      npcPushEvent("boss_spawn", { floor: state.floor, archetype: "mirror_wuxiao" });
+    } else {
+      const pos = findClearSpawnPos(bp.x, bp.y, 20, { others: enemies });
+      const bossHpMul = scale.hpMul * bossMeta.hpMul * eliteBossHpMul(room);
+      const boss = {
+        kind: "boss",
+        bossName: bossMeta.name,
+        ultName: bossMeta.ult,
+        skillId: bossMeta.skillId,
+        skillName: bossMeta.skillName,
+        x: pos.x, y: pos.y,
+        hp: Math.round(380 * bossHpMul),
+        maxHp: Math.round(380 * bossHpMul),
+        radius: 20,
+        speed: 32 * scale.speedMul,
+        shootCd: 1.0,
+        dmgMul: eliteBossDmgMul(scale) * BOSS_DMG_MUL,
+        shootCdMul: scale.shootCdMul,
+        fanChance: bossMeta.fanChance,
+        ultInterval: bossMeta.ultInterval,
+        ultCd: 1.8,
+        aoeColor: bossMeta.aoeColor,
+      };
+      window.GameEnemyAI?.initEnemy(boss, state.floor, room.index);
+      window.GameBossPatterns?.spawnEntranceAoE?.(state, boss);
+      enemies.push(boss);
+      npcPushEvent("boss_spawn", { floor: state.floor });
+    }
   } else {
     for (let i = 0; i < (room.mobs || 0); i += 1) enemies.push(mkMob(false));
     for (let i = 0; i < (room.elite || 0); i += 1) enemies.push(mkMob(true));
@@ -1003,7 +1005,59 @@ function onRoomCleared() {
   }
 }
 
+function playerNearDoor(maxDist = 56) {
+  const room = currentRoom();
+  if (!room || !state.dungeon || room.index >= state.dungeon.rooms.length - 1) return false;
+  const door = window.GameRoomLayouts.getDoorRect(canvas.width, canvas.height);
+  const p = state.player;
+  const nearX = Math.max(door.x, Math.min(p.x, door.x + door.w));
+  const nearY = Math.max(door.y, Math.min(p.y, door.y + door.h));
+  return Math.hypot(p.x - nearX, p.y - nearY) <= maxDist;
+}
+
+/** 贴门但因协同条件未满足时给提示（判词/裂狱等） */
+function tryDoorBlockedHint() {
+  if (state.floorState !== "playing" || state.result) return;
+  if (!playerNearDoor(64)) return;
+  const room = currentRoom();
+  if (!room || room.boss) return;
+  if (room.index >= (state.dungeon?.rooms?.length || 0) - 1) return;
+
+  const now = performance.now();
+  if (state._doorHintAt && now - state._doorHintAt < 2800) return;
+
+  const enemiesLeft = (state.enemies || []).filter((e) => e.hp > 0).length;
+  let msg = null;
+  let bubble = null;
+
+  if (enemiesLeft > 0) {
+    msg = `门未开 · 剩余 ${enemiesLeft} 敌`;
+  } else if (window.GameCoop?.isInfo?.(state) && !state.coop?.info?.solved) {
+    msg = "门未开 · 先解判词：问乌枭「顺序」，按序点甲乙丙丁";
+    bubble = "别瞎撞门。问我顺序，按序点柱。";
+  } else if (window.GameCoop?.isSplit?.(state) && state.coop?.split?.active) {
+    const s = state.coop.split;
+    if (!s.playerDone && !s.allyDone) msg = "门未开 · 裂狱两边都要肃清";
+    else if (!s.playerDone) msg = "门未开 · 你侧尚未肃清";
+    else if (!s.allyDone) msg = "门未开 · 等乌枭清完左侧";
+  } else if (window.GameCoop?.isProxy?.(state) && enemiesLeft > 0) {
+    msg = "门未开 · 代行房需清完敌人";
+  } else if (!state.roomCleared || (window.GameCoop && !window.GameCoop.roomClearGate(state))) {
+    msg = "门未开 · 条件未满足";
+  } else if (state.roomCleared && state._doorNeedsRightKey) {
+    msg = "门已开 · 按 →/D 走进门";
+  }
+
+  if (!msg) return;
+  state._doorHintAt = now;
+  window.GameFx?.floatText?.(state.player.x, state.player.y - 42, msg, "#ffe08a");
+  if (bubble) setAllyBubble(bubble);
+}
+
 function tryEnterDoor() {
+  // 贴门时先尝试提示（含未清房/未解谜）
+  tryDoorBlockedHint();
+
   if (!state.roomCleared || state.floorState !== "playing" || state.result) return;
   if (state.enemies.length > 0) return;
   // 清房后短时禁止自动进门
@@ -1020,6 +1074,7 @@ function tryEnterDoor() {
       && !state.coop?._splitCompleted) {
     return;
   }
+  if (window.GameCoop && !window.GameCoop.roomClearGate(state)) return;
   const door = window.GameRoomLayouts.getDoorRect(canvas.width, canvas.height);
   const p = state.player;
   const nearX = Math.max(door.x, Math.min(p.x, door.x + door.w));
@@ -1193,6 +1248,11 @@ function updateFloorTransition(dt) {
   if (state.floorState !== "clear") return;
   state.transitionTimer -= dt;
   if (state.transitionTimer <= 0) {
+    // 第三关（孽镜）通关后不再进入第4层
+    if (state.floor >= MAX_FLOORS) {
+      showDemoComplete();
+      return;
+    }
     state.floor += 1;
     npcPurgeEvents("room_cleared", "blessing_picked", "floor_clear");
     npcIO.abortCtrl?.abort();
@@ -1200,6 +1260,49 @@ function updateFloorTransition(dt) {
     nextFloor();
     state.floorState = "playing";
   }
+}
+
+function showDemoComplete() {
+  state.floorState = "demo_complete";
+  state.transitionTimer = 0;
+  const overlay = document.getElementById("demoCompleteOverlay");
+  if (overlay) overlay.classList.remove("hidden");
+  setAllyBubble("三狱到此。孽镜假我已斩——想再走一遭就回第一狱。");
+  appendMessage("npc", "【演示结束】当前仅三关。点击按钮回到第一关。");
+}
+
+function restartFromFloorOne() {
+  const overlay = document.getElementById("demoCompleteOverlay");
+  if (overlay) overlay.classList.add("hidden");
+  state.result = "";
+  state.floor = 1;
+  state.floorState = "playing";
+  state.blessingsTaken = [];
+  state.playerDamageMul = 1;
+  state.guardDamageReduction = 0.15;
+  state.dashCdMul = 1;
+  state.blessingShieldMul = 1;
+  state.player.maxHp = PLAYER_BASE_MAX_HP;
+  state.player.hp = PLAYER_BASE_MAX_HP;
+  state.player.speed = PLAYER_BASE_SPEED;
+  state.ally.maxHp = ALLY_BASE_MAX_HP;
+  state.ally.hp = ALLY_BASE_MAX_HP;
+  state.ally.dead = false;
+  state.ally.stance = "guard";
+  state.combo = 0;
+  state.maxCombo = 0;
+  if (window.GameCoop) {
+    state.coop = window.GameCoop.defaultCoop();
+  }
+  if (window.GameSkills) window.GameSkills.ensureSlot(state);
+  npcPurgeEvents("room_cleared", "blessing_picked", "floor_clear", "floor_enter");
+  npcIO.abortCtrl?.abort();
+  npcInitAutonomy();
+  nextFloor();
+  state.floorState = "playing";
+  setAllyBubble("又是第一狱。别指望我手软。");
+  appendMessage("npc", "【重新开始】回到拔舌狱第一关。");
+  updateStatsPanels();
 }
 
 // ── 初始化第一关 ──────────────────────────────────────────────────────────────
@@ -1300,7 +1403,8 @@ function findNearestEnemyInSight(from, range) {
 function gameInputBlocked() {
   return !!state.result
     || state.floorState === "blessing_pick"
-    || state.floorState === "door_transition";
+    || state.floorState === "door_transition"
+    || state.floorState === "demo_complete";
 }
 
 function blessingCardHtml(b) {
@@ -1881,16 +1985,240 @@ function updateAlly(dt) {
   }); // withSplitAllyCombatContext
 }
 
+/** 假乌枭：选可走交战锚点；优先有 LOS 的环带点，否则可走点靠近玩家 */
+function mirrorBossPickEngage(boss, target, cfg) {
+  const lo = cfg.kiteRange + 5;
+  const hi = cfg.attackRange * 0.95;
+  const r = boss.radius;
+  let bestLos = null;
+  let bestLosS = Infinity;
+  let bestAny = null;
+  let bestAnyS = Infinity;
+  for (let i = 0; i < 16; i += 1) {
+    const ang = (Math.PI * 2 * i) / 16;
+    for (const rad of [lo, (lo + hi) * 0.5, hi, hi * 1.15]) {
+      const px = target.x + Math.cos(ang) * rad;
+      const py = target.y + Math.sin(ang) * rad;
+      if (px < r || px > canvas.width - r) continue;
+      if (py < r || py > canvas.height - r) continue;
+      if (collidesWithObstacle(px, py, r)) continue;
+      const sc = Math.hypot(px - boss.x, py - boss.y);
+      if (sc < bestAnyS) { bestAnyS = sc; bestAny = { x: px, y: py }; }
+      if (_rlHasLOS(px, py, target.x, target.y) && sc < bestLosS) {
+        bestLosS = sc;
+        bestLos = { x: px, y: py };
+      }
+    }
+  }
+  if (bestLos) return bestLos;
+  if (bestAny) return bestAny;
+  // 最后：朝玩家方向退半步的可走点
+  for (const dist of [40, 80, 120, 180, 240]) {
+    const [ux, uy] = normalize(target.x - boss.x, target.y - boss.y);
+    const px = boss.x + ux * dist;
+    const py = boss.y + uy * dist;
+    if (px < r || px > canvas.width - r || py < r || py > canvas.height - r) continue;
+    if (!collidesWithObstacle(px, py, r)) return { x: px, y: py };
+  }
+  return { x: target.x, y: target.y };
+}
+
+/** 无 A* 路径时的绕障追击：多方向采样，绝不只直线顶墙 */
+function mirrorBossSteerNoPath(boss, target, speed) {
+  const r = boss.radius;
+  const [dx0, dy0] = normalize(target.x - boss.x, target.y - boss.y);
+  // 直线可走则直冲
+  const tryX = boss.x + dx0 * speed;
+  const tryY = boss.y + dy0 * speed;
+  if (!collidesWithObstacle(tryX, tryY, r)) {
+    return [dx0, dy0];
+  }
+  // 左右扫角找可走方向，偏好更靠近目标的
+  let best = null;
+  let bestScore = -Infinity;
+  for (let k = 0; k < 16; k += 1) {
+    const ang = (Math.PI * 2 * k) / 16;
+    const mx = Math.cos(ang);
+    const my = Math.sin(ang);
+    const nx = boss.x + mx * Math.max(speed, 6);
+    const ny = boss.y + my * Math.max(speed, 6);
+    if (collidesWithObstacle(nx, ny, r)) continue;
+    // 越靠近目标越好，且与朝目标方向夹角别太背
+    const afterD = Math.hypot(target.x - nx, target.y - ny);
+    const toward = mx * dx0 + my * dy0;
+    const score = -afterD + toward * 40;
+    if (score > bestScore) {
+      bestScore = score;
+      best = [mx, my];
+    }
+  }
+  return best || [0, 0];
+}
+
+function mirrorBossReplan(boss, target, cfg, force) {
+  if (!force && boss.navReplanCd > 0 && boss.navPath && boss.navPath.length) return;
+  boss.engagePoint = mirrorBossPickEngage(boss, target, cfg);
+  if (!_navGrid) rebuildNavGrid();
+  // 先寻路到锚点；失败再寻路到目标附近可走点
+  let raw = findPath(_navGrid, boss, boss.engagePoint);
+  if (!raw || !raw.length) {
+    const nearTarget = findClearSpawnPos(target.x, target.y, boss.radius, {});
+    raw = findPath(_navGrid, boss, nearTarget);
+    if (raw && raw.length) boss.engagePoint = nearTarget;
+  }
+  boss.navPath = raw && raw.length ? smoothPath(raw, allObstacles(), boss.radius) : null;
+  boss.navReplanCd = force ? 0.2 : 0.32;
+  boss._lastTargetX = target.x;
+  boss._lastTargetY = target.y;
+}
+
+function updateMirrorBoss(dt) {
+  const boss = state.enemies.find((e) => e.bossArchetype === "mirror_wuxiao" && e.hp > 0);
+  if (!boss || state.floorState !== "playing" || state.result) return;
+  const MB = window.GameMirrorBoss;
+  if (!MB) return;
+
+  if (boss.phase < 2 && boss.hp / boss.maxHp <= 0.5) {
+    boss.phase = 2;
+    boss.speed *= 1.1;
+    window.GameFx?.floatText?.(boss.x, boss.y - 40, "镜裂", "#cc88ff");
+    window.GameBossPatterns?.spawnGroundAoE?.(state, boss, state.player, {
+      count: 4,
+      damage: Math.round(12 * (boss.dmgMul || 1)),
+      color: boss.aoeColor || "#aa88ff",
+    });
+  }
+
+  boss.attackCd = Math.max(0, (boss.attackCd || 0) - dt);
+  boss.navReplanCd = (boss.navReplanCd || 0) - dt;
+
+  let target = state.player;
+  if (state.ally.hp > 0) {
+    const dp = distance(boss, state.player);
+    const da = distance(boss, state.ally);
+    if (state.player.hp / state.player.maxHp < 0.35 && da < dp * 1.15) target = state.ally;
+    else if (da + 50 < dp) target = state.ally;
+  }
+
+  const cfg = { attackRange: 110, kiteRange: 65 };
+  const d = distance(boss, target);
+  const los = _rlHasLOS(boss.x, boss.y, target.x, target.y);
+  const prevLost = boss.losLostFrames || 0;
+  boss.losStableFrames = los ? (boss.losStableFrames || 0) + 1 : 0;
+  boss.losLostFrames = los ? 0 : prevLost + 1;
+
+  // 目标大挪 / 刚丢视线 / 无路径 → 强制重规划
+  const targetMoved = boss._lastTargetX != null
+    && Math.hypot(target.x - boss._lastTargetX, target.y - boss._lastTargetY) > 48;
+  const justLostLos = !los && prevLost === 0;
+  const needForceReplan = justLostLos || !boss.navPath || !boss.navPath.length || targetMoved
+    || (boss.combatPhase !== "combat" && boss.navReplanCd <= 0);
+
+  if (needForceReplan) {
+    mirrorBossReplan(boss, target, cfg, justLostLos || !boss.navPath);
+  }
+
+  const inEnvelope = d <= cfg.attackRange * 1.3;
+  const speed = boss.speed * (boss.phase >= 2 ? 1.08 : 1) * dt;
+
+  if (_rlLoadState === "idle") _rlLoadModel();
+
+  // 无视线时不要赖在 combat 站桩，尽快回 approach 追
+  if (boss.combatPhase === "combat" && (!los && boss.losLostFrames >= 10 || !inEnvelope)) {
+    boss.combatPhase = "approach";
+    boss.navPath = null;
+    mirrorBossReplan(boss, target, cfg, true);
+  }
+
+  if (boss.combatPhase !== "combat") {
+    // ── APPROACH：A*；失败则多向绕障，禁止直线顶墙发呆 ──
+    let mx = 0;
+    let my = 0;
+    if (boss.navPath && boss.navPath.length) {
+      [mx, my] = steerAlong(boss.navPath, boss, allObstacles(), boss.radius);
+      // 路径跟不动（被墙顶住）则作废重寻
+      if (Math.abs(mx) + Math.abs(my) < 1e-4) {
+        boss.navPath = null;
+        mirrorBossReplan(boss, target, cfg, true);
+        if (boss.navPath && boss.navPath.length) {
+          [mx, my] = steerAlong(boss.navPath, boss, allObstacles(), boss.radius);
+        }
+      }
+    }
+    if (Math.abs(mx) + Math.abs(my) < 1e-4) {
+      [mx, my] = mirrorBossSteerNoPath(boss, target, Math.max(speed, 4));
+    }
+    const prevX = boss.x;
+    const prevY = boss.y;
+    moveWithCollision(boss, mx * speed, my * speed);
+    // 几乎没动：再强制重规划 + 侧向挤出
+    if (Math.hypot(boss.x - prevX, boss.y - prevY) < 0.15) {
+      boss.navPath = null;
+      mirrorBossReplan(boss, target, cfg, true);
+      const [sx, sy] = mirrorBossSteerNoPath(boss, target, Math.max(speed, 8));
+      moveWithCollision(boss, sx * speed * 1.2, sy * speed * 1.2);
+    }
+    // 有视线且进距 → combat
+    if (d <= cfg.attackRange && los && boss.losStableFrames >= 6) {
+      boss.combatPhase = "combat";
+      boss.navPath = null;
+      boss.losLostFrames = 0;
+      MB.reset();
+    }
+  } else {
+    // ── COMBAT：独立 ONNX；无视线时上面已切回 approach ──
+    if (_rlLoadState === "ready" && _rlSession) {
+      MB.inferAsync(_rlSession, boss, target, state, allObstacles(), _rlHasLOS);
+      const action = MB.resolveAction(boss, state);
+      let [mx, my] = MB.actionVector(action);
+      // RL 输出静止且目标已远/无视线：强制朝目标挪一步，避免站桩
+      if (Math.abs(mx) + Math.abs(my) < 1e-4 && (d > cfg.kiteRange || !los)) {
+        [mx, my] = mirrorBossSteerNoPath(boss, target, Math.max(speed, 4));
+      }
+      moveWithCollision(boss, mx * speed, my * speed);
+    } else {
+      let mx = 0;
+      let my = 0;
+      if (d > cfg.attackRange) [mx, my] = mirrorBossSteerNoPath(boss, target, Math.max(speed, 4));
+      else if (d < cfg.kiteRange) [mx, my] = normalize(boss.x - target.x, boss.y - target.y);
+      else {
+        const [tx, ty] = normalize(target.x - boss.x, target.y - boss.y);
+        mx = -ty; my = tx;
+      }
+      moveWithCollision(boss, mx * speed, my * speed);
+    }
+  }
+
+  if (boss.attackCd <= 0 && d < cfg.attackRange + 30) {
+    if (canBulletShoot(boss, target, cfg.attackRange + 20)) {
+      const dmg = Math.round(14 * (boss.dmgMul || 1) * (boss.phase >= 2 ? 1.15 : 1));
+      const b = createBullet("enemy", boss, target, 360, dmg);
+      b.color = "#cc88ff";
+      state.enemyBullets.push(b);
+      boss.attackCd = boss.phase >= 2 ? 0.38 : 0.48;
+    } else {
+      boss.attackCd = 0.15;
+      // 射不出：立刻重寻绕到有视线的点
+      if (!los) mirrorBossReplan(boss, target, cfg, true);
+    }
+  }
+
+  boss.x = clampUnit(boss.x, boss.radius, canvas.width - boss.radius);
+  boss.y = clampUnit(boss.y, boss.radius, canvas.height - boss.radius);
+}
+
 function updateEnemies(dt) {
   if (state.floorState !== "playing") return;
   if (state.result) return;
   window.GameEnemyAI.tickCombatMotion?.(state, dt);
   window.GameEnemyAI.updateEliteRoomAnchors?.(state, dt, _enemyAIHelpers);
-  // 玩家侧（右半 / 同屏）
+  // 玩家侧（右半 / 同屏）；镜像 Boss 用专用 AI
   state.enemies.forEach((enemy) => {
+    if (enemy.bossArchetype === "mirror_wuxiao") return;
     if (isAllySplitCombat()) enemy._splitSide = "player";
     window.GameEnemyAI.updateEnemyCombat(enemy, dt, state, _enemyAIHelpers);
   });
+  updateMirrorBoss(dt);
   // 裂狱乌枭侧：复用完整敌 AI（含 A*），子弹写入左侧列表
   if (isAllySplitCombat() && state.coop?.split) {
     const s = state.coop.split;
@@ -2167,6 +2495,19 @@ function drawRoomExit() {
     ctx.fillStyle = "rgba(140, 135, 155, 0.9)";
     ctx.textAlign = "center";
     ctx.fillText("封", cx, cy + 5);
+    // 怪已清但协同条件未完成时，门上写清原因
+    const noEnemies = state.enemies.length === 0;
+    if (noEnemies && window.GameCoop?.isInfo?.(state) && !state.coop?.info?.solved) {
+      ctx.font = "10px PingFang SC, Arial, sans-serif";
+      ctx.fillStyle = "#ffcc88";
+      ctx.fillText("需解判词", cx, cy + 22);
+    } else if (noEnemies && window.GameCoop?.isSplit?.(state) && state.coop?.split?.active) {
+      ctx.font = "10px PingFang SC, Arial, sans-serif";
+      ctx.fillStyle = "#ffcc88";
+      const s = state.coop.split;
+      const tip = !s.allyDone ? "等乌枭" : (!s.playerDone ? "清你侧" : "未完成");
+      ctx.fillText(tip, cx, cy + 22);
+    }
   }
   ctx.textAlign = "left";
 }
@@ -2179,8 +2520,9 @@ function drawEntityLabel(entity, text, color) {
   ctx.textAlign = "left";
 }
 
-/** 乌枭：鬼差高冠 + 黑签披风，与狱卒形貌区分 */
-function drawAllySprite(entity, dir = 1) {
+/** 乌枭：鬼差高冠 + 黑签披风；opts.mirror 时供假身复用外形 */
+function drawAllySprite(entity, dir = 1, opts = {}) {
+  const mirror = !!opts.mirror;
   const px = 4;
   const originX = Math.floor(entity.x - 7 * px);
   const originY = Math.floor(entity.y - 10 * px);
@@ -2196,14 +2538,23 @@ function drawAllySprite(entity, dir = 1) {
     "0015005100",
     "0006006000",
   ];
-  const map = {
-    "1": "#1a3020",
-    "2": "#d4b896",
-    "3": "#9af5a0",
-    "4": "#2d5a38",
-    "5": "#7ee88a",
-    "6": "#1a1a22",
-  };
+  const map = mirror
+    ? {
+      "1": "#1a1030",
+      "2": "#c4b0d6",
+      "3": "#d4a0ff",
+      "4": "#4a2a68",
+      "5": "#b080e8",
+      "6": "#1a1022",
+    }
+    : {
+      "1": "#1a3020",
+      "2": "#d4b896",
+      "3": "#9af5a0",
+      "4": "#2d5a38",
+      "5": "#7ee88a",
+      "6": "#1a1a22",
+    };
 
   rows.forEach((row, rowIdx) => {
     [...row].forEach((cell, colIdx) => {
@@ -2214,8 +2565,16 @@ function drawAllySprite(entity, dir = 1) {
     });
   });
 
-  ctx.fillStyle = "#3a2820";
+  ctx.fillStyle = mirror ? "#2a1840" : "#3a2820";
   ctx.fillRect(Math.floor(entity.x - 3), Math.floor(entity.y + entity.radius - 2), 6, 3);
+
+  if (mirror) return; // 血条与标签由 drawEnemySprite 绘制
+
+  // 友方绿圈，便于与镜影区分
+  ctx.strokeStyle = "rgba(154, 241, 155, 0.55)";
+  ctx.beginPath();
+  ctx.arc(entity.x, entity.y, entity.radius + 6, 0, Math.PI * 2);
+  ctx.stroke();
 
   const w = entity.radius * 2;
   const hpRatio = clampUnit(entity.hp / (entity.maxHp || 100), 0, 1);
@@ -2223,11 +2582,32 @@ function drawAllySprite(entity, dir = 1) {
   ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w, 4);
   ctx.fillStyle = "#b8f7b6";
   ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w * hpRatio, 4);
-  drawEntityLabel(entity, "枭", "#b8f7b6");
+  drawEntityLabel(entity, "真·枭", "#b8f7b6");
 }
 
 /** 狱卒 / 精英 / Boss */
 function drawEnemySprite(entity, dir = 1) {
+  // 孽镜假乌枭：同模异色
+  if (entity.bossArchetype === "mirror_wuxiao" || entity.looksLike === "ally") {
+    ctx.save();
+    ctx.shadowColor = "#aa66ff";
+    ctx.shadowBlur = 10;
+    drawAllySprite(entity, dir, { mirror: true });
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(180, 100, 255, 0.7)";
+    ctx.beginPath();
+    ctx.arc(entity.x, entity.y, entity.radius + 7, 0, Math.PI * 2);
+    ctx.stroke();
+    const w = entity.radius * 2;
+    const hpRatio = clampUnit(entity.hp / (entity.maxHp || 100), 0, 1);
+    ctx.fillStyle = "#101317";
+    ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w, 4);
+    ctx.fillStyle = "#d4a0ff";
+    ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w * hpRatio, 4);
+    drawEntityLabel(entity, "镜影", "#cc88ff");
+    ctx.restore();
+    return;
+  }
   if (entity.kind === "shade") {
     ctx.globalAlpha = 0.72;
     drawPixelSprite(entity, { outline: "#1a1420", skin: "#6a5a7a", eye: "#cc88ff", cloth: "#3a2848", trim: "#8866aa", hp: "#aa88cc" }, dir);
@@ -3558,10 +3938,10 @@ function loop(ts) {
 // ── 输入 ──────────────────────────────────────────────────────────────────────
 
 function tryCastSkillKey(e) {
-  // 聊天输入中不抢 1
+  // 聊天输入中不抢 E
   const tag = (document.activeElement && document.activeElement.tagName) || "";
   if (tag === "INPUT" || tag === "TEXTAREA") return false;
-  if (e.code !== "Digit1" && e.code !== "Numpad1") return false;
+  if (e.code !== "KeyE") return false;
   e.preventDefault();
   if (!window.GameSkills) return true;
   window.GameSkills.ensureSlot(state);
@@ -3614,8 +3994,8 @@ chatForm.addEventListener("submit", async (e) => {
 appendMessage("npc", "黑签鬼差乌枭到位。你别乱送，我就能把你带到无间边狱。");
 appendMessage(
   "npc",
-  "【本局】清完前厅进第2间「裂狱并行」：左=乌枭，右=你（出口在最右），两边都清完才开门。"
-  + "对话改姿态（守护/突击）；技能槽按 1 释放（默认契印连携）。",
+  "【三关演示】①拔舌 ②剪刀 ③孽镜（Boss 为假乌枭）。"
+  + "对话改姿态；技能按 E 释放契印连携。通关第三狱后可回第一关。",
 );
 npcInitAutonomy();
 window.__npcPushEvent = npcPushEvent;
@@ -3629,5 +4009,8 @@ if (window.GameDungeonGen) {
   const preview = window.GameDungeonGen.generate(1).map((r) => r.type).join(",");
   console.info("[DUNGEON] preview floor1 types:", preview);
 }
+document.getElementById("btnRestartFloor1")?.addEventListener("click", () => {
+  restartFromFloorOne();
+});
 setInterval(npcTickAutonomy, 800);
 requestAnimationFrame(loop);

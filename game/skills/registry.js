@@ -5,8 +5,8 @@
       id: "pact_combo",
       name: "契印连携",
       shortName: "连携",
-      keyHint: "1",
-      desc: "贴乌枭作战攒契印，按1与乌枭齐攻",
+      keyHint: "E",
+      desc: "贴乌枭作战攒契印，按E与乌枭齐攻",
       canUse(state) {
         if (!state || state.result) return { ok: false, reason: "战斗外" };
         if (state.floorState !== "playing") return { ok: false, reason: "非战斗" };
@@ -102,7 +102,7 @@
 
     ctx.font = "bold 12px PingFang SC, Segoe UI, Arial";
     ctx.fillStyle = split ? "#888" : ready ? "#ffd9bf" : "#d9bca4";
-    const title = split ? `[1] ${skill.shortName} · 裂狱禁用` : `[1] ${skill.shortName}`;
+    const title = split ? `[E] ${skill.shortName} · 裂狱禁用` : `[E] ${skill.shortName}`;
     ctx.fillText(title, x, y + 10);
 
     ctx.fillStyle = "#333";
@@ -112,7 +112,7 @@
 
     ctx.font = "10px PingFang SC, Segoe UI, Arial";
     ctx.fillStyle = "#c8b8a8";
-    if (ready && !split) ctx.fillText("就绪 · 按1释放", x + w - 72, y + 10);
+    if (ready && !split) ctx.fillText("就绪 · 按E", x + w - 58, y + 10);
     else if (!split) ctx.fillText(`${Math.round(ratio * 100)}%`, x + w - 28, y + 10);
   }
 

@@ -849,7 +849,7 @@
       c.combo.windowOpen = true;
       c.combo.windowT = 10;
       c.combo.ready = true;
-      window.GameFx?.floatText(player.x, player.y - 48, "契印就绪 · 按1", "#ffd9bf");
+      window.GameFx?.floatText(player.x, player.y - 48, "契印就绪 · 按E", "#ffd9bf");
     }
     if (c.combo.windowOpen) {
       c.combo.windowT -= dt;
