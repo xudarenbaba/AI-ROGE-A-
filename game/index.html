@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
     <title>AI Roguelite 网页演示</title>
-    <link rel="stylesheet" href="styles.css?v=demo3e" />
+    <link rel="stylesheet" href="styles.css?v=demo3f" />
   </head>
   <body>
     <div class="layout">
@@ -14,11 +14,12 @@
           <h1>《无间行录》：三狱演示</h1>
           <p>
             三关：拔舌狱 → 剪刀狱 → <strong>孽镜狱</strong>（Boss 为假乌枭，绿标真身）。
-            对话改姿态；技能按 <strong>E</strong> 释放契印连携。通关第三狱后可回第一关。
+            对话改姿态；技能按 <strong>E</strong> 释放契印连携；按住 <strong>L</strong> 语音指挥。通关第三狱后可回第一关。
           </p>
         </div>
         <div class="canvas-wrap">
           <canvas id="gameCanvas" width="960" height="540"></canvas>
+          <div id="voicePttStatus" class="voice-ptt hidden" aria-live="polite"></div>
           <div id="blessingOverlay" class="blessing-overlay hidden">
             <h3>选择狱印</h3>
             <p class="blessing-hint">魂体印强化你 · 鬼差印强化乌枭 · 契约印强化配合 · 可重复叠层</p>
@@ -33,7 +34,7 @@
         <div class="hud">
           <div id="hudStats"></div>
           <p class="tips">
-            移动：WASD | 射击：空格 | 闪避：Shift | 技能：E | 姿态对话：守护/突击 | 清房后靠右门
+            移动：WASD | 射击：空格 | 闪避：Shift | 技能：E | 按住 L 语音 | 姿态：守护/突击 | 清房后靠右门
           </p>
         </div>
       </section>
@@ -51,28 +52,29 @@
           <input id="chatInput" autocomplete="off" maxlength="160" placeholder="姿态：守护我 / 突击..." />
           <button type="submit">发送</button>
         </form>
+        <p class="voice-hint">按住 <kbd>L</kbd> 语音输入（松开发送）</p>
       </aside>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/ort.min.js"></script>
-    <script src="pathfinding.js?v=demo3e"></script>
-    <script src="obstacles/layouts.js?v=demo3e"></script>
-    <script src="dungeon/roomLayouts.js?v=demo3e"></script>
-    <script src="dungeon/generator.js?v=demo3e"></script>
-    <script src="dungeon/minimap.js?v=demo3e"></script>
-    <script src="dungeon/doorTransition.js?v=demo3e"></script>
-    <script src="combat/shooting.js?v=demo3e"></script>
-    <script src="combat/hazards.js?v=demo3e"></script>
-    <script src="enemies/eliteRegistry.js?v=demo3e"></script>
-    <script src="enemies/abilities.js?v=demo3e"></script>
-    <script src="bosses/registry.js?v=demo3e"></script>
-    <script src="bosses/mirrorWuxiao.js?v=demo3e"></script>
-    <script src="bosses/patterns.js?v=demo3e"></script>
-    <script src="fx.js?v=demo3e"></script>
-    <script src="bullets/patterns.js?v=demo3e"></script>
-    <script src="meta/blessings.js?v=demo3e"></script>
-    <script src="coop/coop.js?v=demo3e"></script>
-    <script src="skills/registry.js?v=demo3e"></script>
-    <script src="game.js?v=demo3e"></script>
+    <script src="pathfinding.js?v=demo3f"></script>
+    <script src="obstacles/layouts.js?v=demo3f"></script>
+    <script src="dungeon/roomLayouts.js?v=demo3f"></script>
+    <script src="dungeon/generator.js?v=demo3f"></script>
+    <script src="dungeon/minimap.js?v=demo3f"></script>
+    <script src="dungeon/doorTransition.js?v=demo3f"></script>
+    <script src="combat/shooting.js?v=demo3f"></script>
+    <script src="combat/hazards.js?v=demo3f"></script>
+    <script src="enemies/eliteRegistry.js?v=demo3f"></script>
+    <script src="enemies/abilities.js?v=demo3f"></script>
+    <script src="bosses/registry.js?v=demo3f"></script>
+    <script src="bosses/mirrorWuxiao.js?v=demo3f"></script>
+    <script src="bosses/patterns.js?v=demo3f"></script>
+    <script src="fx.js?v=demo3f"></script>
+    <script src="bullets/patterns.js?v=demo3f"></script>
+    <script src="meta/blessings.js?v=demo3f"></script>
+    <script src="coop/coop.js?v=demo3f"></script>
+    <script src="skills/registry.js?v=demo3f"></script>
+    <script src="game.js?v=demo3f"></script>
   </body>
 </html>

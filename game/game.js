@@ -1,6 +1,6 @@
 const NPC_API = "http://192.168.33.133:5100";
 const NPC_AUTONOMY_BUILD = "autonomy10";
-const GAME_BUILD = "demo3e";
+const GAME_BUILD = "demo3f";
 const MAX_FLOORS = 3;
 
 // ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
@@ -3968,7 +3968,240 @@ function tryCastSkillKey(e) {
   return true;
 }
 
+// ── Push-to-Talk：按住 L 语音 → 松开发送（Web Speech API）────────────────────
+
+const VOICE_PTT_KEY = "KeyL";
+const VOICE_MIN_MS = 350;
+const VOICE_MAX_MS = 10000;
+const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+const voicePttEl = document.getElementById("voicePttStatus");
+
+const voicePtt = {
+  phase: "idle", // idle | recording | processing
+  rec: null,
+  startedAt: 0,
+  finals: [],
+  interim: "",
+  maxTimer: null,
+  finishTimer: null,
+  seq: 0,
+  supported: !!SpeechRecognitionAPI,
+};
+
+function isTypingInField() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = (el.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (el.isContentEditable) return true;
+  return false;
+}
+
+function isVoicePttBlocked(e) {
+  if (e && (e.ctrlKey || e.metaKey || e.altKey)) return true;
+  return isTypingInField();
+}
+
+function setVoiceStatus(text, mode) {
+  if (!voicePttEl) return;
+  const show = !!(text && String(text).trim());
+  voicePttEl.textContent = show ? text : "";
+  voicePttEl.classList.toggle("hidden", !show);
+  voicePttEl.classList.toggle("voice-ptt--recording", mode === "recording");
+  voicePttEl.classList.toggle("voice-ptt--busy", mode === "busy");
+  voicePttEl.classList.toggle("voice-ptt--error", mode === "error");
+}
+
+function clearVoiceTimers() {
+  if (voicePtt.maxTimer) {
+    clearTimeout(voicePtt.maxTimer);
+    voicePtt.maxTimer = null;
+  }
+  if (voicePtt.finishTimer) {
+    clearTimeout(voicePtt.finishTimer);
+    voicePtt.finishTimer = null;
+  }
+}
+
+function voiceTranscript() {
+  return `${voicePtt.finals.join("")}${voicePtt.interim || ""}`.replace(/\s+/g, " ").trim();
+}
+
+function ensureVoiceRec() {
+  if (!voicePtt.supported) return null;
+  if (voicePtt.rec) return voicePtt.rec;
+
+  const rec = new SpeechRecognitionAPI();
+  rec.lang = "zh-CN";
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+
+  rec.onresult = (ev) => {
+    let interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const r = ev.results[i];
+      const t = (r[0] && r[0].transcript) || "";
+      if (r.isFinal) voicePtt.finals.push(t);
+      else interim += t;
+    }
+    voicePtt.interim = interim;
+    if (voicePtt.phase === "recording") {
+      const preview = voiceTranscript();
+      setVoiceStatus(preview ? `聆听中：${preview}` : "按住 L 说话… 松开发送", "recording");
+    }
+  };
+
+  rec.onerror = (ev) => {
+    const err = ev.error || "";
+    if (err === "aborted" || err === "no-speech") return;
+    if (err === "not-allowed" || err === "service-not-allowed") {
+      clearVoiceTimers();
+      voicePtt.phase = "idle";
+      voicePtt.finals = [];
+      voicePtt.interim = "";
+      setVoiceStatus("麦克风权限被拒绝，请在浏览器允许后重试", "error");
+      setTimeout(() => {
+        if (voicePtt.phase === "idle") setVoiceStatus("", "");
+      }, 3200);
+    }
+  };
+
+  rec.onend = () => {
+    // Chrome 常在按住过程中自动 end，仍在 recording 则重启
+    if (voicePtt.phase === "recording") {
+      try { rec.start(); } catch (_) { /* already started */ }
+      return;
+    }
+    if (voicePtt.phase === "processing") finishVoiceTranscript();
+  };
+
+  voicePtt.rec = rec;
+  return rec;
+}
+
+function startVoicePtt() {
+  if (voicePtt.phase !== "idle") return;
+  if (!voicePtt.supported) {
+    setVoiceStatus("当前浏览器不支持语音识别（请用 Chrome / Edge）", "error");
+    setTimeout(() => {
+      if (voicePtt.phase === "idle") setVoiceStatus("", "");
+    }, 3000);
+    return;
+  }
+  const rec = ensureVoiceRec();
+  if (!rec) return;
+
+  voicePtt.phase = "recording";
+  voicePtt.startedAt = performance.now();
+  voicePtt.finals = [];
+  voicePtt.interim = "";
+  voicePtt.seq += 1;
+  setVoiceStatus("按住 L 说话… 松开发送", "recording");
+
+  try {
+    rec.start();
+  } catch (_) {
+    // InvalidStateError：已在跑
+  }
+
+  clearVoiceTimers();
+  voicePtt.maxTimer = setTimeout(() => {
+    if (voicePtt.phase === "recording") stopVoicePtt({ send: true });
+  }, VOICE_MAX_MS);
+}
+
+function stopVoicePtt({ send }) {
+  if (voicePtt.phase !== "recording") return;
+  clearVoiceTimers();
+  const elapsed = performance.now() - voicePtt.startedAt;
+
+  if (!send || elapsed < VOICE_MIN_MS) {
+    voicePtt.phase = "idle";
+    voicePtt.finals = [];
+    voicePtt.interim = "";
+    try { voicePtt.rec && voicePtt.rec.abort(); } catch (_) { /* ignore */ }
+    if (send && elapsed < VOICE_MIN_MS) {
+      setVoiceStatus("说话时间太短", "error");
+      setTimeout(() => {
+        if (voicePtt.phase === "idle") setVoiceStatus("", "");
+      }, 1500);
+    } else {
+      setVoiceStatus("", "");
+    }
+    return;
+  }
+
+  voicePtt.phase = "processing";
+  setVoiceStatus("识别中…", "busy");
+  try {
+    voicePtt.rec && voicePtt.rec.stop();
+  } catch (_) {
+    finishVoiceTranscript();
+    return;
+  }
+  // onend 兜底
+  voicePtt.finishTimer = setTimeout(() => {
+    if (voicePtt.phase === "processing") finishVoiceTranscript();
+  }, 1200);
+}
+
+function finishVoiceTranscript() {
+  if (voicePtt.phase !== "processing") return;
+  if (voicePtt.finishTimer) {
+    clearTimeout(voicePtt.finishTimer);
+    voicePtt.finishTimer = null;
+  }
+
+  const text = voiceTranscript();
+  voicePtt.phase = "idle";
+  voicePtt.finals = [];
+  voicePtt.interim = "";
+
+  if (!text) {
+    setVoiceStatus("没听清，请再试", "error");
+    setTimeout(() => {
+      if (voicePtt.phase === "idle") setVoiceStatus("", "");
+    }, 2000);
+    return;
+  }
+
+  setVoiceStatus("", "");
+  appendMessage("player", text);
+  sendPlayerChat(text);
+}
+
+function cancelVoicePtt(reason) {
+  if (voicePtt.phase === "idle") return;
+  clearVoiceTimers();
+  voicePtt.phase = "idle";
+  voicePtt.finals = [];
+  voicePtt.interim = "";
+  try { voicePtt.rec && voicePtt.rec.abort(); } catch (_) { /* ignore */ }
+  if (reason) {
+    setVoiceStatus(reason, "error");
+    setTimeout(() => {
+      if (voicePtt.phase === "idle") setVoiceStatus("", "");
+    }, 1400);
+  } else {
+    setVoiceStatus("", "");
+  }
+}
+
 document.addEventListener("keydown", (e) => {
+  if (e.code === VOICE_PTT_KEY) {
+    // 输入框内不抢 L；战斗中 L 不当其它逻辑键
+    if (!isVoicePttBlocked(e)) {
+      e.preventDefault();
+      if (!e.repeat) startVoicePtt();
+    }
+    return;
+  }
+  if (e.code === "Escape" && voicePtt.phase === "recording") {
+    e.preventDefault();
+    cancelVoicePtt("已取消");
+    return;
+  }
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "KeyW", "KeyA", "KeyS", "KeyD"].includes(e.code)) {
     e.preventDefault();
   }
@@ -3980,7 +4213,20 @@ document.addEventListener("keydown", (e) => {
   }
   tryCastSkillKey(e);
 });
-document.addEventListener("keyup", (e) => { state.keys[e.code] = false; });
+document.addEventListener("keyup", (e) => {
+  if (e.code === VOICE_PTT_KEY) {
+    if (voicePtt.phase === "recording") {
+      e.preventDefault();
+      stopVoicePtt({ send: true });
+    }
+    return;
+  }
+  state.keys[e.code] = false;
+});
+window.addEventListener("blur", () => cancelVoicePtt());
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) cancelVoicePtt();
+});
 
 chatForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -3995,7 +4241,7 @@ appendMessage("npc", "黑签鬼差乌枭到位。你别乱送，我就能把你�
 appendMessage(
   "npc",
   "【三关演示】①拔舌 ②剪刀 ③孽镜（Boss 为假乌枭）。"
-  + "对话改姿态；技能按 E 释放契印连携。通关第三狱后可回第一关。",
+  + "对话改姿态；技能 E；按住 L 语音指挥。通关第三狱后可回第一关。",
 );
 npcInitAutonomy();
 window.__npcPushEvent = npcPushEvent;
