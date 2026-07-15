@@ -1,4 +1,4 @@
-const NPC_API = "http://127.0.0.1:5100";
+const NPC_API = "http://192.168.33.133:5100";
 const NPC_AUTONOMY_BUILD = "autonomy10";
 const GAME_BUILD = "demo3e";
 const MAX_FLOORS = 3;
