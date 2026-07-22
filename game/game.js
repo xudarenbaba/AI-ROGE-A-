@@ -1833,9 +1833,50 @@ function withSplitAllyCombatContext(fn) {
   }
 }
 
+/**
+ * 乌枭倒地（hp≤0）：只 A* 贴玩家身边挂着，禁止攻击 / rescue / RL。
+ * 裂狱交给 coop 的 5s 复活逻辑，不在此半场幽灵跟随。
+ * hp 任意来源回升后，下一帧 allyIsDown() 为 false，自动恢复正常 AI。
+ */
+function updateAllyDownedFollow(dt) {
+  if (isAllySplitCombat()) return;
+
+  state.ally.stance = "guard";
+  const speed = state.ally.speed * 0.85;
+  const d = distance(state.ally, state.player);
+  // 倒地更积极贴身：超过停靠距就继续靠拢
+  const chasing = shouldGuardFollow(d) || d > _GUARD_FOLLOW_STOP;
+
+  if (chasing) {
+    const prevX = state.ally._guardMovePrevX ?? state.ally.x;
+    const prevY = state.ally._guardMovePrevY ?? state.ally.y;
+    let followPt = state.ally.guardFollowPt || findGuardFollowPoint(state.player);
+    const stale = isGuardPathStale(followPt);
+    planGuardFollow(dt, { force: !state.ally.guardNavPath || stale });
+    followPt = state.ally.guardFollowPt || followPt;
+    const [mx, my] = guardSteerDirection(followPt);
+    moveWithCollision(state.ally, mx * speed * dt, my * speed * dt);
+    const moved = Math.hypot(state.ally.x - prevX, state.ally.y - prevY);
+    state.ally._guardMovePrevX = state.ally.x;
+    state.ally._guardMovePrevY = state.ally.y;
+    tickGuardWedged(dt, moved, Math.abs(mx) + Math.abs(my) > 1e-4);
+  } else {
+    state.ally.guardWedgedT = 0;
+  }
+
+  const allyR = state.ally.radius;
+  const allyMinX = window.GameRoomLayouts?.playerMinX?.(state.roomIndex, allyR) ?? 10;
+  state.ally.x = clampUnit(state.ally.x, allyMinX, canvas.width - allyR);
+  state.ally.y = clampUnit(state.ally.y, allyR, canvas.height - allyR);
+}
+
 function updateAlly(dt) {
+  // 每帧同步生命态：hp>0 时清 dead；过层回血 / 治疗 / 裂狱复活均靠此 + allyIsDown 恢复行动
   syncAllyLifeState({ announce: false });
-  if (allyIsDown()) return;
+  if (allyIsDown()) {
+    updateAllyDownedFollow(dt);
+    return;
+  }
 
   const split = isAllySplitCombat();
   // 裂狱：强制突击，走正常 A* + RL（上下文切到左侧敌人）
@@ -1973,15 +2014,13 @@ function updateAlly(dt) {
     setAllyBubble("先后撤，我给你护盾。");
   }
 
-  if (!allyIsDown()) {
-    tickEntityStuckEscape(state.ally, dt, {
-      moving: allyMoving,
-      speed,
-      warn: "乌枭卡住…",
-      free: "乌枭脱困",
-      bubble: "墙缝太窄，我挣脱出来了。",
-    });
-  }
+  tickEntityStuckEscape(state.ally, dt, {
+    moving: allyMoving,
+    speed,
+    warn: "乌枭卡住…",
+    free: "乌枭脱困",
+    bubble: "墙缝太窄，我挣脱出来了。",
+  });
   }); // withSplitAllyCombatContext
 }
 
@@ -2523,6 +2562,7 @@ function drawEntityLabel(entity, text, color) {
 /** 乌枭：鬼差高冠 + 黑签披风；opts.mirror 时供假身复用外形 */
 function drawAllySprite(entity, dir = 1, opts = {}) {
   const mirror = !!opts.mirror;
+  const downed = !mirror && (entity.hp || 0) <= 0;
   const px = 4;
   const originX = Math.floor(entity.x - 7 * px);
   const originY = Math.floor(entity.y - 10 * px);
@@ -2556,6 +2596,11 @@ function drawAllySprite(entity, dir = 1, opts = {}) {
       "6": "#1a1a22",
     };
 
+  if (downed) {
+    ctx.save();
+    ctx.globalAlpha = 0.42;
+  }
+
   rows.forEach((row, rowIdx) => {
     [...row].forEach((cell, colIdx) => {
       if (cell === "0") return;
@@ -2568,21 +2613,26 @@ function drawAllySprite(entity, dir = 1, opts = {}) {
   ctx.fillStyle = mirror ? "#2a1840" : "#3a2820";
   ctx.fillRect(Math.floor(entity.x - 3), Math.floor(entity.y + entity.radius - 2), 6, 3);
 
-  if (mirror) return; // 血条与标签由 drawEnemySprite 绘制
+  if (mirror) {
+    if (downed) ctx.restore();
+    return; // 血条与标签由 drawEnemySprite 绘制
+  }
 
-  // 友方绿圈，便于与镜影区分
-  ctx.strokeStyle = "rgba(154, 241, 155, 0.55)";
+  // 友方绿圈，便于与镜影区分；倒地改灰圈表示灵核失稳
+  ctx.strokeStyle = downed ? "rgba(160, 170, 190, 0.55)" : "rgba(154, 241, 155, 0.55)";
   ctx.beginPath();
   ctx.arc(entity.x, entity.y, entity.radius + 6, 0, Math.PI * 2);
   ctx.stroke();
+
+  if (downed) ctx.restore();
 
   const w = entity.radius * 2;
   const hpRatio = clampUnit(entity.hp / (entity.maxHp || 100), 0, 1);
   ctx.fillStyle = "#101317";
   ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w, 4);
-  ctx.fillStyle = "#b8f7b6";
+  ctx.fillStyle = downed ? "#8899aa" : "#b8f7b6";
   ctx.fillRect(entity.x - entity.radius, entity.y - entity.radius - 10, w * hpRatio, 4);
-  drawEntityLabel(entity, "真·枭", "#b8f7b6");
+  drawEntityLabel(entity, downed ? "失稳" : "真·枭", downed ? "#aab4c4" : "#b8f7b6");
 }
 
 /** 狱卒 / 精英 / Boss */
