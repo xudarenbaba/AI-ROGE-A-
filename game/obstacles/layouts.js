@@ -1,5 +1,5 @@
 /**
- * 障碍布局。碰撞盒 x,y,w,h 与 rl/env.py OBSTACLE_LAYOUTS 对齐；kind 仅渲染用。
+ * 障碍布局。碰撞盒 x,y,w,h 与 rl/limbs/assault_skirmish/env.py OBSTACLE_LAYOUTS 对齐；kind 仅渲染用。
  */
 (function () {
   const LAYOUTS = [

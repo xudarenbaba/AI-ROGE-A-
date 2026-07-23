@@ -1,3 +1,15 @@
-# rl/ — assault 姿态强化学习模块
-# 独立于游戏服务端，只提供训练环境和模型导出工具。
-# 游戏端只需要 game/assault_policy.onnx，与此模块无运行时依赖。
+"""
+rl/ — 强化学习包
+
+每个策略网络独占：
+    rl/limbs/<limb_id>/
+      env.py train.py export_onnx.py
+      checkpoints/ logs/ config.yaml
+
+突击网络：
+    python -m rl.limbs.assault_skirmish.train
+    python -m rl.limbs.assault_skirmish.export_onnx
+
+游戏只加载：
+    game/resources/limbs/<limb_id>/policy.onnx
+"""

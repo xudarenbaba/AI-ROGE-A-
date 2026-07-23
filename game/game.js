@@ -3,14 +3,14 @@ const NPC_AUTONOMY_BUILD = "autonomy10";
 const GAME_BUILD = "demo3f";
 const MAX_FLOORS = 3;
 
-// ── RL 推理模块（assault 姿态）────────────────────────────────────────────────
-// onnxruntime-web 从 CDN 加载；如需离线部署可改为本地路径。
-// 模型文件 assault_policy.onnx 放在 game/ 目录下。
-// 在模型加载完成前，assault 姿态降级为规则 AI。
+// ── RL 推理模块（assault_skirmish）────────────────────────────────────────────
+// onnxruntime-web 从 CDN 加载；模型只在 game/resources/limbs/<id>/。
+// 加载完成前 assault 姿态降级为规则 AI。
 
-const _RL_MODEL_PATH = "assault_policy.onnx";
+const _RL_LIMB_ID = "assault_skirmish";
+const _RL_MODEL_PATH = "resources/limbs/assault_skirmish/policy.onnx";
 
-// 与 rl/env.py ACTION_VECTORS 严格对齐（索引 0-8）
+// 与 rl/limbs/assault_skirmish/env.py ACTION_VECTORS 严格对齐（索引 0-8）
 const _RL_ACTION_VECTORS = [
   [ 0.0,  0.0],          // 0 静止
   [ 0.0, -1.0],          // 1 上
@@ -23,7 +23,7 @@ const _RL_ACTION_VECTORS = [
   [-0.7071, -0.7071],    // 8 左上
 ];
 
-// 与 rl/env.py 常量对齐（战斗专家版：射线检测 + LSTM，OBS_DIM=109）
+// 与 rl/limbs/assault_skirmish/env.py 常量对齐（战斗专家版：射线检测 + LSTM，OBS_DIM=109）
 const _RL_CANVAS_W        = 900.0;
 const _RL_CANVAS_H        = 540.0;
 const _RL_DIAG            = Math.hypot(_RL_CANVAS_W, _RL_CANVAS_H);  // ~1051
@@ -119,7 +119,7 @@ async function _rlLoadModel() {
     });
     _rlResetLstmState();   // 初始化 LSTM hidden state 为全零
     _rlLoadState = "ready";
-    console.log("[RL] assault_policy.onnx (LSTM) loaded, RL mode active.");
+    console.log(`[RL] ${_RL_LIMB_ID} loaded from ${_RL_MODEL_PATH}, RL mode active.`);
   } catch (e) {
     _rlLoadState = "error";
     console.error("[RL] Failed to load model:", e);
@@ -318,7 +318,7 @@ function _rlRaycast(ox, oy, dx, dy) {
 }
 
 // === RL FROZEN: _rlBuildObs / _rlResolveAction / ONNX — 训完前勿改 ===
-// 构建 109 维观测向量，与 rl/env.py _get_obs() 严格对齐（战斗专家版）
+// 构建 109 维观测向量，与 rl/limbs/assault_skirmish/env.py _get_obs() 严格对齐
 function _rlBuildObs(attackCd) {
   const obs  = new Float32Array(_RL_OBS_DIM);
   const ally = state.ally;
@@ -421,7 +421,7 @@ function _rlBuildObs(attackCd) {
 }
 
 function _rlNearestEnemy() {
-  // LOS 加权评分，与 rl/env.py _nearest_enemy 严格对齐
+  // LOS 加权评分，与 rl/limbs/assault_skirmish/env.py _nearest_enemy 严格对齐
   // 评分 = 距离 × (LOS通畅 ? 1.0 : 1.3)，轻度偏好有视线且近的敌人
   if (state.enemies.length === 0) return null;
   const ally = state.ally;
@@ -583,6 +583,7 @@ const state = {
   keys: {},
   result: "",
   playerId: "player_web_demo",
+  runId: "",
   floor: 1,
   floorState: "playing", // playing | blessing_pick | clear | door_transition
   transitionTimer: 0,
@@ -674,7 +675,7 @@ function isClearSpawn(x, y, radius, opts = {}) {
   return true;
 }
 
-// 优先靠近 prefer，失败则网格扫描可行走区域（与 rl/env.py _safe_spawn 对齐并加强回退）
+// 优先靠近 prefer，失败则网格扫描可行走区域（与 assault_skirmish env._safe_spawn 对齐）
 function findClearSpawnPos(preferX, preferY, radius, opts = {}) {
   const minX = opts.minX ?? spawnMinX(radius);
   const maxX = canvas.width - radius;
@@ -1242,6 +1243,11 @@ function nextFloor() {
   initFloorDungeon();
   const meta = FLOOR_META[(state.floor - 1) % FLOOR_META.length];
   setAllyBubble(`第 ${state.floor} 层 ${meta.name}。${meta.hint}`);
+  ensureRunId();
+  npcRecordRunEvent(`进入第${state.floor}层：${meta.name}`, {
+    tier: "minor",
+    tags: ["floor_enter"],
+  });
 }
 
 function updateFloorTransition(dt) {
@@ -1267,6 +1273,14 @@ function showDemoComplete() {
   state.transitionTimer = 0;
   const overlay = document.getElementById("demoCompleteOverlay");
   if (overlay) overlay.classList.remove("hidden");
+  npcRecordRunEvent("三狱演示通关，孽镜假乌枭已斩", {
+    tier: "major",
+    tags: ["run_clear", "demo_complete"],
+  });
+  npcRecordReflection(
+    "本局三狱通关；高压弹幕时宜灵活切换守护/突击，优先听玩家指挥。",
+    { source: "run_clear" },
+  );
   setAllyBubble("三狱到此。孽镜假我已斩——想再走一遭就回第一狱。");
   appendMessage("npc", "【演示结束】当前仅三关。点击按钮回到第一关。");
 }
@@ -1274,6 +1288,11 @@ function showDemoComplete() {
 function restartFromFloorOne() {
   const overlay = document.getElementById("demoCompleteOverlay");
   if (overlay) overlay.classList.add("hidden");
+  // 旧局反思（跨局）；再开新 run_id
+  npcRecordReflection(
+    `上一局打到第${state.floor}层结束；乌枭默认倾向守护贴身，听玩家口令切换突击。`,
+    { source: "run_end" },
+  );
   state.result = "";
   state.floor = 1;
   state.floorState = "playing";
@@ -1297,9 +1316,14 @@ function restartFromFloorOne() {
   if (window.GameSkills) window.GameSkills.ensureSlot(state);
   npcPurgeEvents("room_cleared", "blessing_picked", "floor_clear", "floor_enter");
   npcIO.abortCtrl?.abort();
+  ensureRunId({ forceNew: true });
   npcInitAutonomy();
   nextFloor();
   state.floorState = "playing";
+  npcRecordRunEvent(`新开局 run=${state.runId}，进入第1层拔舌狱`, {
+    tier: "major",
+    tags: ["run_start"],
+  });
   setAllyBubble("又是第一狱。别指望我手软。");
   appendMessage("npc", "【重新开始】回到拔舌狱第一关。");
   updateStatsPanels();
@@ -2399,6 +2423,10 @@ function checkDefeat() {
     state.ally.guardReplanCd = 0;
     setAllyBubble("灵核失稳...你先继续前进。");
     // 气泡只设一次（3秒），后续不再重置
+    npcRecordRunEvent(
+      `第${state.floor}层：乌枭倒地，灵核失稳，贴挂跟随`,
+      { tier: "major", tags: ["ally_down", "downed_tether"] },
+    );
   }
 }
 
@@ -3307,8 +3335,68 @@ function npcBuildTacticalContext() {
   };
 }
 
+function npcNewRunId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function ensureRunId({ forceNew = false } = {}) {
+  if (forceNew || !state.runId) {
+    state.runId = npcNewRunId();
+    console.info("[NPC] run_id =", state.runId);
+  }
+  return state.runId;
+}
+
+/** 本局事件 → type=run_event（需 run_id） */
+function npcRecordRunEvent(text, opts = {}) {
+  const rid = ensureRunId();
+  const body = {
+    player_id: state.playerId,
+    npc_id: NPC_ID,
+    run_id: rid,
+    text: String(text || "").slice(0, 240),
+    tier: opts.tier || "major",
+    source: opts.source || "system",
+    tags: opts.tags || [],
+    scene_info: {
+      floor: state.floor,
+      room_label: (typeof currentRoom === "function" && currentRoom())
+        ? (currentRoom().label || currentRoom().type || "")
+        : "",
+      run_id: rid,
+    },
+  };
+  if (!body.text) return;
+  fetch(`${NPC_API}/api/memory/run_event`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => console.warn("[NPC] run_event failed", err));
+}
+
+/** 局末反思 → type=reflection（跨局） */
+function npcRecordReflection(text, opts = {}) {
+  const body = {
+    player_id: state.playerId,
+    npc_id: NPC_ID,
+    text: String(text || "").slice(0, 240),
+    source_run_id: state.runId || "",
+    source: opts.source || "system",
+  };
+  if (!body.text) return;
+  fetch(`${NPC_API}/api/memory/reflection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => console.warn("[NPC] reflection failed", err));
+}
+
 function npcInitAutonomy() {
   const t = performance.now();
+  ensureRunId({ forceNew: !state.runId });
   npcIO.lastPlayerMsgAt = t;
   npcIO.lastPlayerActionAt = t;
   npcIO.autonomyStartAt = t;
@@ -3402,6 +3490,8 @@ function buildSceneInfo(trigger = "reactive") {
   const hazardCtx = npcHazardContext();
 
   const scene = {
+    run_id: ensureRunId(),
+    active_limb: state.ally.stance === "assault" ? "assault_skirmish" : "guard_follow",
     mode: state.floorState === "blessing_pick" ? "blessing_pick" : "dungeon",
     can_autonomy_speak: canSpeak,
     floor: state.floor,
@@ -3558,6 +3648,14 @@ function applyStance(stance, reply, opts = {}) {
     appendMessage("npc", bubble);
     npcMarkSpeech();
     if (stanceChanged) npcIO.lastStanceChangeAt = performance.now();
+  }
+  if (stanceChanged) {
+    const limb = stance === "assault" ? "assault_skirmish" : "guard_follow";
+    const src = opts.autonomous ? "auto" : "player";
+    npcRecordRunEvent(
+      `第${state.floor}层：姿态切为${stance}（limb=${limb}，来源=${src}）`,
+      { tier: "major", tags: ["stance", stance, limb, src] },
+    );
   }
 }
 
@@ -3836,6 +3934,7 @@ function npcEnqueueThink(evaluation) {
       player_id: state.playerId,
       npc_id: NPC_ID,
       npc_name: NPC_NAME,
+      run_id: ensureRunId(),
       trigger: evaluation.trigger,
       priority: evaluation.priority,
       trigger_reason: evaluation.reason,
@@ -3915,6 +4014,7 @@ async function sendPlayerChat(message) {
     player_id: state.playerId,
     npc_id: NPC_ID,
     npc_name: NPC_NAME,
+    run_id: ensureRunId(),
     message,
     scene_info: buildSceneInfo("reactive"),
   };

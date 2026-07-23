@@ -23,6 +23,8 @@ memory:
   k_persona: 3
   k_dialogue_daily: 4
   k_dialogue_important: 6
+  k_run_event: 5
+  k_reflection: 2
   min_store_chars: 6
 
 npc_autonomy:

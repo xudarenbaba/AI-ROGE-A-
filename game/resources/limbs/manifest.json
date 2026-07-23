@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "default_limb": "guard_follow",
+  "limbs": {
+    "assault_skirmish": {
+      "kind": "rl_onnx",
+      "path": "resources/limbs/assault_skirmish/policy.onnx",
+      "meta": "resources/limbs/assault_skirmish/meta.json",
+      "role": "清怪突击微操（现有突击网络）",
+      "legacy_stance": "assault",
+      "obs_schema": "combat_v1_109"
+    },
+    "guard_follow": {
+      "kind": "rule",
+      "role": "贴身守护 / 倒地贴挂",
+      "legacy_stance": "guard"
+    },
+    "downed_tether": {
+      "kind": "rule",
+      "role": "倒地幽灵跟随玩家",
+      "legacy_stance": "guard"
+    }
+  }
+}

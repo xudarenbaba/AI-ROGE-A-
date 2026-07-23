@@ -104,6 +104,9 @@ def autonomous_decide(
     allowed_intents: list[str] | None = None,
     trigger: str = "periodic",
     chat_thread: list[dict[str, str]] | None = None,
+    run_event_chunks: list[str] | None = None,
+    reflection_chunks: list[str] | None = None,
+    working_block: str = "",
 ) -> dict[str, Any]:
     """
     自主思考：根据局面决定 noop / command / dialogue。
@@ -127,6 +130,9 @@ def autonomous_decide(
         allowed_intents=allowed_intents,
         trigger=trigger or str(scene_info.get("trigger", "periodic")),
         chat_thread=chat_thread,
+        run_event_chunks=run_event_chunks,
+        reflection_chunks=reflection_chunks,
+        working_block=working_block,
     )
     cfg = load_config().get("llm", {})
     decide_model = cfg.get("decide_model") or cfg.get("model", "deepseek-chat")

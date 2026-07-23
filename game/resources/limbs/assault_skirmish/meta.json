@@ -1,0 +1,11 @@
+{
+  "limb_id": "assault_skirmish",
+  "obs_dim": 109,
+  "n_actions": 9,
+  "lstm_hidden": 128,
+  "lstm_layers": 1,
+  "model_file": "policy.onnx",
+  "opset": 12,
+  "recurrent": true,
+  "description": "assault_skirmish RecurrentPPO (LSTM). Inputs: obs[1,obs_dim], h_in, c_in. Outputs: logits, h_out, c_out."
+}

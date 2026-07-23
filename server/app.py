@@ -9,7 +9,12 @@ from flask_cors import CORS
 
 from server.npc_backend.graph import NpcConversationEngine
 from server.npc_backend.log_config import npc_logger, setup_npc_logging
-from server.npc_backend.schemas import ChatRequest, ThinkRequest
+from server.npc_backend.schemas import (
+    ChatRequest,
+    ReflectionRequest,
+    RunEventRequest,
+    ThinkRequest,
+)
 
 
 def create_app() -> Flask:
@@ -32,6 +37,7 @@ def create_app() -> Flask:
                 message=str(body.get("message", "")).strip(),
                 scene_info=body.get("scene_info") or {},
                 npc_name=str(body.get("npc_name", "")).strip() or None,
+                run_id=str(body.get("run_id", "")).strip(),
             )
         except Exception as e:  # noqa: BLE001
             return Response(
@@ -49,10 +55,11 @@ def create_app() -> Flask:
 
         payload = {
             "player_id": req.player_id,
-            "npc_id":    req.npc_id,
-            "npc_name":  req.npc_name,
-            "message":   req.message,
+            "npc_id": req.npc_id,
+            "npc_name": req.npc_name,
+            "message": req.message,
             "scene_info": req.scene_info,
+            "run_id": req.run_id,
         }
 
         return Response(
@@ -72,6 +79,7 @@ def create_app() -> Flask:
                 trigger=str(body.get("trigger", "periodic")).strip() or "periodic",
                 priority=int(body.get("priority", 3)),
                 trigger_reason=str(body.get("trigger_reason", "")).strip(),
+                run_id=str(body.get("run_id", "")).strip(),
             )
         except Exception as e:  # noqa: BLE001
             return Response(
@@ -88,8 +96,9 @@ def create_app() -> Flask:
             )
 
         npc_logger().info(
-            "HTTP /api/npc/think player=%s trigger=%s p=%s reason=%s",
+            "HTTP /api/npc/think player=%s trigger=%s p=%s reason=%s run=%s",
             req.player_id, req.trigger, req.priority, req.trigger_reason or "-",
+            req.run_id or "-",
         )
 
         payload = {
@@ -100,12 +109,71 @@ def create_app() -> Flask:
             "trigger": req.trigger,
             "priority": req.priority,
             "trigger_reason": req.trigger_reason,
+            "run_id": req.run_id,
         }
 
         return Response(
             stream_with_context(engine.stream_think(payload)),
             mimetype="application/x-ndjson",
         )
+
+    @app.post("/api/memory/run_event")
+    def api_memory_run_event() -> tuple[Any, int]:
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            req = RunEventRequest(
+                player_id=str(body.get("player_id", "")).strip(),
+                npc_id=str(body.get("npc_id", "")).strip(),
+                run_id=str(body.get("run_id", "")).strip(),
+                text=str(body.get("text", "")).strip(),
+                tier=str(body.get("tier", "major")).strip() or "major",
+                source=str(body.get("source", "system")).strip() or "system",
+                scene_info=body.get("scene_info") or {},
+                tags=list(body.get("tags") or []),
+            )
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"invalid_request: {e}"}), 400
+
+        if not req.player_id or not req.npc_id or not req.run_id or not req.text:
+            return jsonify({"ok": False, "error": "player_id, npc_id, run_id, text required"}), 400
+
+        ok = engine.memory.add_run_event(
+            player_id=req.player_id,
+            npc_id=req.npc_id,
+            run_id=req.run_id,
+            text=req.text,
+            tier=req.tier,
+            source=req.source,
+            scene_info=req.scene_info,
+            tags=req.tags,
+        )
+        return jsonify({"ok": ok, "type": "run_event"}), 200 if ok else 200
+
+    @app.post("/api/memory/reflection")
+    def api_memory_reflection() -> tuple[Any, int]:
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            req = ReflectionRequest(
+                player_id=str(body.get("player_id", "")).strip(),
+                npc_id=str(body.get("npc_id", "")).strip(),
+                text=str(body.get("text", "")).strip(),
+                source_run_id=str(body.get("source_run_id", "")).strip(),
+                source=str(body.get("source", "system")).strip() or "system",
+            )
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"invalid_request: {e}"}), 400
+
+        if not req.player_id or not req.npc_id or not req.text:
+            return jsonify({"ok": False, "error": "player_id, npc_id, text required"}), 400
+
+        ok = engine.memory.add_reflection(
+            player_id=req.player_id,
+            npc_id=req.npc_id,
+            text=req.text,
+            source_run_id=req.source_run_id,
+            source=req.source,
+        )
+        return jsonify({"ok": ok, "type": "reflection"}), 200
 
     return app
 

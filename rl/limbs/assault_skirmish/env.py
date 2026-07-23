@@ -1,5 +1,7 @@
 """
-AssaultEnv — 与 game.js 物理完全对齐的 gymnasium 环境。
+AssaultEnv — assault_skirmish 肢专用 gymnasium 环境（与 game.js 物理对齐）。
+
+归属：rl/limbs/assault_skirmish/（与 train.py / export_onnx.py 同目录）。
 
 战斗专家版：导航（绕障接近）由 game.js 的 A* 寻路负责，本环境只训练
 "射程内战斗微操"。因此 episode 直接在敌人射程内开局，agent 输出 9 个离散

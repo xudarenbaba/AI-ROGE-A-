@@ -277,8 +277,13 @@ def build_messages(
     chat_thread: list[dict[str, str]] | None = None,
     chat_mode: str = "rest_banter",
     last_npc_line: str = "",
+    run_event_chunks: list[str] | None = None,
+    reflection_chunks: list[str] | None = None,
+    working_block: str = "",
 ) -> list[dict[str, str]]:
     """玩家对话：system + 上下文 user + 真多轮 history + 当前 user。"""
+    from server.npc_backend.memory import format_memory_prompt_blocks
+
     narrative = narrative_context or {}
     combat = is_combat_scene(scene_info)
     length_rule = (
@@ -303,18 +308,23 @@ def build_messages(
         mode="chat",
     )
 
-    # 人设：固定核心已在 system；RAG 仅作补充，限量
-    persona_extra = _join_lines((persona_chunks or [])[:2])
-    world_extra = _join_lines((world_chunks or [])[:2])
-    mem_imp = _join_lines((dialogue_important_chunks or [])[:4])
-    mem_daily = _join_lines((dialogue_daily_chunks or [])[:3])
+    memory_blocks = format_memory_prompt_blocks(
+        {
+            "persona_chunks": (persona_chunks or [])[:2],
+            "world_chunks": (world_chunks or [])[:2],
+            "reflection_chunks": (reflection_chunks or [])[:2],
+            "dialogue_important_chunks": (dialogue_important_chunks or [])[:4],
+            "dialogue_daily_chunks": (dialogue_daily_chunks or [])[:3],
+            "run_event_chunks": (run_event_chunks or [])[:4],
+        }
+    )
+    working = (working_block or "").strip()
+    working_section = f"[工作记忆]\n{working}\n\n" if working else ""
 
     context_user = (
         f"{context}\n\n"
-        f"[角色补充]\n{persona_extra}\n\n"
-        f"[世界补充]\n{world_extra}\n\n"
-        f"[对话记忆-重要]\n{mem_imp}\n\n"
-        f"[对话记忆-日常]\n{mem_daily}\n\n"
+        f"{memory_blocks}\n\n"
+        f"{working_section}"
         f"[最近自主发言日志]\n{narrative.get('recent_autonomous', '无')}\n\n"
         "以上是你的处境与记忆。下面是你与玩家的近期对话；请以乌枭身份自然接话。"
     )
@@ -404,7 +414,12 @@ def build_autonomous_decide_messages(
     allowed_intents: list[str] | None = None,
     trigger: str = "periodic",
     chat_thread: list[dict[str, str]] | None = None,
+    run_event_chunks: list[str] | None = None,
+    reflection_chunks: list[str] | None = None,
+    working_block: str = "",
 ) -> list[dict[str, str]]:
+    from server.npc_backend.memory import format_memory_prompt_blocks
+
     narrative = narrative_context or {}
     short_term_lines = [
         f"{item.get('role', 'unknown')}: {item.get('content', '')}"
@@ -427,14 +442,27 @@ def build_autonomous_decide_messages(
         mode="think",
     )
     stance_sem = str(scene_info.get("stance_semantics", "")).strip() or "无"
+    # 战斗 think：主用本局事件 + important；少 daily/world
+    memory_blocks = format_memory_prompt_blocks(
+        {
+            "persona_chunks": (persona_chunks or [])[:1],
+            "world_chunks": (world_chunks or [])[:0],
+            "reflection_chunks": (reflection_chunks or [])[:1],
+            "dialogue_important_chunks": (dialogue_important_chunks or [])[:3],
+            "dialogue_daily_chunks": (dialogue_daily_chunks or [])[:0],
+            "run_event_chunks": (run_event_chunks or [])[:5],
+        }
+    )
+    working = (working_block or "").strip()
+    working_section = f"[工作记忆]\n{working}\n\n" if working else ""
     user_prompt = (
         f"{context}\n\n"
         f"[姿态语义]\n{stance_sem}\n\n"
         f"[规则参考]\n{_rule_hints_block(scene_info)}\n\n"
         f"[本轮建议intent]\n{intent_hint}\n\n"
         f"[触发类型]\n{trigger}\n\n"
-        f"[角色补充]\n{_join_lines((persona_chunks or [])[:2])}\n\n"
-        f"[对话记忆-重要]\n{_join_lines((dialogue_important_chunks or [])[:3])}\n\n"
+        f"{memory_blocks}\n\n"
+        f"{working_section}"
         f"[近期对话]\n{_join_lines(short_term_lines) if short_term_lines else '无'}\n\n"
         f"[最近自主发言]\n{narrative.get('recent_autonomous', '无')}\n\n"
         f"[触发]\n自主思考：玩家暂时无输入，trigger={trigger}，请评估局面并决策。"

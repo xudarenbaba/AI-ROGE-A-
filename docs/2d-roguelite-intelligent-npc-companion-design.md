@@ -43,9 +43,9 @@
 | 反射层 | `server/npc_backend/reflex.py` | 危急局面零 LLM 响应（<1ms） |
 | 触发器 | `server/npc_backend/triggers.py` | P0-P3 优先级战术/社交模板 |
 | 长期记忆 | `server/npc_backend/memory.py` | ChromaDB（world/persona/dialogue） |
-| RL 环境 | `rl/env.py` | AssaultEnv，109 维观测，Gymnasium |
-| RL 训练 | `rl/train.py` | RecurrentPPO（LSTM） |
-| ONNX 导出 | `rl/export_onnx.py` | 浏览器端推理 |
+| RL 环境 | `rl/limbs/assault_skirmish/env.py` | AssaultEnv，109 维观测，Gymnasium |
+| RL 训练 | `rl/limbs/assault_skirmish/train.py` | RecurrentPPO（LSTM） |
+| ONNX 导出 | `rl/limbs/assault_skirmish/export_onnx.py` | → `game/resources/limbs/...` |
 | 游戏前端 | `game/game.js` | scene_info 上报、assault FSM、ONNX 推理 |
 | 寻路 | `game/pathfinding.js` | A* 绕障（assault 接近 / guard 跟随） |
 
